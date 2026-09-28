@@ -3,33 +3,33 @@
 # Hardware: Waveshare ESP32-H2-Zero + VL53L1X ToF Laser Sensor
 # Description: Low-power Zigbee distance monitor for motorized awnings
 # =========================================================================
+external_components:
+  - source: github://damienmorrissey/esphome-vl53l1x
+    components: [vl53l1x]
+
+esphome:
+  name: esphome-zigbee-tof-awning-senso
+  friendly_name: esphome-zigbee-tof-awning-sensor
+  on_boot:
+    priority: -100
+    then:
+      lambda: id(deep_sleep_module).set_sleep_duration(id(sleep_duration_ms));
 
 esp32:
   board: esp32-h2-devkitm-1
   framework:
     type: esp-idf
 
-# Initialize native ESPHome Zigbee component
-zb_device:
-  name: "esphome-zigbee-tof-awning-sensor"
-  ieee_address: "auto"
-
-# Synchronize internal clock via Zigbee network
-time:
-  - platform: sntp
-    id: local_time
+# Native Zigbee stack configuration (end device, battery powered)
+zigbee:
+  id: my_zigbee
+  router: false
 
 # --- DYNAMIC PARAMETERS STORED IN FLASH MEMORY ---
+# NOTE: these have no WiFi/API and Zigbee "number" is not supported on ESP32,
+# so they only act as documented defaults — change initial_value and reflash
+# to adjust them, there is no remote control path today.
 globals:
-  # Night-time Deep Sleep schedule hours
-  - id: sleep_start_hour
-    type: int
-    restore_value: yes
-    initial_value: '20' # Default: 20:00 (8 PM)
-  - id: sleep_end_hour
-    type: int
-    restore_value: yes
-    initial_value: '7'  # Default: 07:00 (7 AM)
   # Awning calibration values (stored in millimeters)
   - id: awning_closed_zero
     type: float
@@ -39,8 +39,8 @@ globals:
     type: float
     restore_value: yes
     initial_value: '2200.0'  # Default: 220cm
-  # Night sleep duration tracker (in milliseconds)
-  - id: night_sleep_duration
+  # Deep sleep duration applied between every wake cycle, day and night alike (in milliseconds)
+  - id: sleep_duration_ms
     type: int
     restore_value: yes
     initial_value: '1800000' # Default: 30 minutes (30 * 60 * 1000)
@@ -50,31 +50,9 @@ i2c:
   scl: GPIO7
   scan: true
 
-# --- CONFIGURATION ENTITIES (Exposed as Number fields in HA) ---
+# --- CONFIGURATION ENTITIES (on-device defaults, see NOTE above) ---
 number:
-  # 1. DeepSleep Start Hour
-  - platform: template
-    name: "DeepSleep Start Hour"
-    icon: "mdi:bed"
-    min_value: 16
-    max_value: 23
-    step: 1
-    initial_value: 20
-    set_action:
-      lambda: id(sleep_start_hour) = x;
-        
-  # 2. DeepSleep End Hour
-  - platform: template
-    name: "DeepSleep End Hour"
-    icon: "mdi:weather-sunset-up"
-    min_value: 5
-    max_value: 11
-    step: 1
-    initial_value: 7
-    set_action:
-      lambda: id(sleep_end_hour) = x;
-
-  # 3. Closed Position Calibration Zero Point
+  # 1. Closed Position Calibration Zero Point
   - platform: template
     name: "Awning Closed Position Zero"
     unit_of_measurement: "cm"
@@ -86,7 +64,7 @@ number:
     set_action:
       lambda: id(awning_closed_zero) = x * 10.0; # Converts input cm to mm
 
-  # 4. Maximum Awning Length Calibration
+  # 2. Maximum Awning Length Calibration
   - platform: template
     name: "Awning Max Length"
     unit_of_measurement: "cm"
@@ -98,9 +76,9 @@ number:
     set_action:
       lambda: id(awning_max_length) = x * 10.0; # Converts input cm to mm
 
-  # 5. Night-time Deep Sleep Cycle Duration
+  # 3. Deep Sleep Duration (applied continuously, no day/night distinction)
   - platform: template
-    name: "Night Deep Sleep Duration"
+    name: "Deep Sleep Duration"
     unit_of_measurement: "min"
     icon: "mdi:moon-waning-crescent"
     min_value: 5
@@ -108,9 +86,11 @@ number:
     step: 5
     initial_value: 30
     set_action:
-      lambda: id(night_sleep_duration) = x * 60 * 1000; # Converts minutes to ms
+      lambda: |-
+        id(sleep_duration_ms) = x * 60 * 1000;
+        id(deep_sleep_module).set_sleep_duration(id(sleep_duration_ms));
 
-  # 6. Laser Distance Reading Interval (Adjusts local poll rate)
+  # 4. Laser Distance Reading Interval (Adjusts local poll rate)
   - platform: template
     name: "Laser Poll Interval"
     unit_of_measurement: "ms"
@@ -124,47 +104,38 @@ number:
         // Dynamically adjusts the update interval of the physical VL53L1X sensor
         id(raw_laser_distance).set_update_interval(x);
 
-
-# --- TELEMETRY SENSORS (Exposed as Sensor entities in HA) ---
+# --- TELEMETRY SENSORS (Exposed as Sensor entities via Zigbee) ---
+# Physical ToF Laser Sensor Component (VL53L1X)
 sensor:
-  # Physical ToF Laser Sensor Component (VL53L1X)
   - platform: vl53l1x
     id: raw_laser_distance
     distance_mode: LONG
+    timing_budget: 50ms
+    enable_pin: GPIO5
     update_interval: 500ms
-    xshut_pin: 
-      number: GPIO5
-      mode: OUTPUT
     filters:
       # Only transmits data via Zigbee radio if the awning shifts by more than 2 cm
       # This saves massive battery power when the awning is completely stationary
-      - delta: 0.02 
+      - delta: 0.02
 
-  # 7. CALCULATED AWNING POSITION (0% Closed - 100% Fully Open)
+  # 5. CALCULATED AWNING POSITION (0% Closed - 100% Fully Open)
   - platform: template
     name: "Awning Opening Percentage"
     unit_of_measurement: "%"
     accuracy_decimals: 0
     icon: "mdi:storefront-outline"
+    endpoint: 1
     lambda: |-
       if (isnan(id(raw_laser_distance).state)) return {};
       float d = id(raw_laser_distance).state * 1000.0; // Raw measurement in mm
-      
+
       // Enforce the calibration bounds stored in globals
       if (d < id(awning_closed_zero)) d = id(awning_closed_zero);
       if (d > id(awning_max_length)) d = id(awning_max_length);
-      
+
       return ((d - id(awning_closed_zero)) / (id(awning_max_length) - id(awning_closed_zero))) * 100.0;
 
-  # 8. ZIGBEE LINK QUALITY (LQI)
-  - platform: zb_device_source
-    name: "Link Quality"
-    type: lqi
-    unit_of_measurement: "lqi"
-    accuracy_decimals: 0
-    update_interval: 60s
-
-  # 9. BATTERY VOLTAGE
+  # 6. BATTERY VOLTAGE
   - platform: adc
     pin: GPIO1
     name: "Battery Voltage"
@@ -172,17 +143,19 @@ sensor:
     unit_of_measurement: "V"
     accuracy_decimals: 2
     update_interval: 60s
+    endpoint: 2
     filters:
       # Multiplier to scale the voltage back up from the 100k/100k hardware voltage divider
-      - multiply: 2.0 
+      - multiply: 2.0
 
-  # 10. BATTERY PERCENTAGE
+  # 7. BATTERY PERCENTAGE
   - platform: template
     name: "Battery Percentage"
     unit_of_measurement: "%"
     accuracy_decimals: 0
     icon: "mdi:battery"
     update_interval: 60s
+    endpoint: 3
     lambda: |-
       if (isnan(id(battery_voltage).state)) return {};
       float v = id(battery_voltage).state;
@@ -191,26 +164,12 @@ sensor:
       if (r < 0.0) r = 0.0;
       return r;
 
-
-# --- CONDITIONED BEHAVIORAL DEEP SLEEP LOGIC ---
-interval:
-  - interval: 30s
-    then:
-      lambda: |-
-        auto time_now = id(local_time).now();
-        if (!time_now.is_valid()) return; // Wait until Zigbee/SNTP syncs the actual clock time
-        
-        int current_hour = time_now.hour;
-        
-        // Checks if the current time falls inside the user-configured night-time sleep window
-        if (current_hour >= id(sleep_start_hour) || current_hour < id(sleep_end_hour)) {
-          ESP_LOGD("main", "Night schedule matched. Triggering Deep Sleep cycle...");
-          
-          // Inject the sleep duration set dynamically from the Home Assistant card widget
-          id(deep_sleep_module).set_sleep_duration(id(night_sleep_duration));
-          id(deep_sleep_module).start();
-        }
-
+# --- UNCONDITIONED DEEP SLEEP DUTY CYCLE ---
+# No clock/network involved: the device always wakes, transmits, and sleeps
+# for a fixed duration, forever. run_duration triggers deep sleep automatically
+# once it elapses; sleep_duration is overridden at boot from sleep_duration_ms
+# (see esphome: on_boot above).
 deep_sleep:
   id: deep_sleep_module
-  run_duration: 15s # Stays awake for 15s during night wake-ups to broadcast battery updates before sleeping again
+  run_duration: 15s       # Stays awake for 15s to read the sensor and broadcast updates
+  sleep_duration: 30min   # Default sleep length; overridden at boot from sleep_duration_ms
