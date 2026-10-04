@@ -16,7 +16,7 @@ The hardware is the same; pick the firmware that fits your needs.
 | Folder | Framework | Status | Remote configuration over Zigbee |
 | :--- | :--- | :--- | :--- |
 | [`esphome/`](esphome/README.md) | ESPHome (ESP-IDF) | Available | No: calibration and sleep values are set at compile time |
-| [`arduino/`](arduino/README.md) | Arduino-ESP32 (`arduino-cli`) | Work in progress (skeleton) | Goal of this firmware |
+| [`arduino/`](arduino/README.md) | Arduino-ESP32 (`arduino-cli`) | Work in progress (first draft, untested) | Yes: writable Zigbee attributes stored in NVS |
 
 Repository layout:
 
@@ -93,6 +93,6 @@ All grounds must merge into a single logical point (**Common GND**). Follow this
 Once the hardware is assembled, flash one of the two firmwares:
 
 * **[ESPHome firmware](esphome/README.md)**: YAML configuration, flashing via the ESPHome dashboard / web tool, pairing with Zigbee2MQTT or ZHA. Settings are fixed at compile time.
-* **[Arduino firmware](arduino/README.md)**: `arduino-cli` project with build and flash instructions. Work in progress, aimed at parameters writable over Zigbee.
+* **[Arduino firmware](arduino/README.md)**: `arduino-cli` project with build and flash instructions. First draft, aimed at parameters writable over Zigbee.
 
 In both cases the ESP32-H2-Zero is flashed over its native **USB Type-C port** the first time, since it speaks Zigbee and not Wi-Fi.
