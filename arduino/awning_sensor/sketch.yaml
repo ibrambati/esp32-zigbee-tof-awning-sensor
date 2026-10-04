@@ -1,5 +1,0 @@
-# arduino-cli sketch configuration.
-# FQBN options verified against the arduino-esp32 boards.txt for the ESP32-H2:
-#   ZigbeeMode=ed          -> Zigbee ED (end device)
-#   PartitionScheme=zigbee -> Zigbee 4MB with spiffs (the H2FH4S has 4 MB flash)
-default_fqbn: esp32:esp32:esp32h2:ZigbeeMode=ed,PartitionScheme=zigbee
