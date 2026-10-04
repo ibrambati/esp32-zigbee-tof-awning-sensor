@@ -42,8 +42,8 @@
 
 // ===================== PIN =====================
 static const uint8_t PIN_VBAT   = 1;   // ADC1_CH0, partitore 100k/100k + 100nF
-static const uint8_t PIN_SDA    = 2;   // NB: il README principale indica GPIO 6/7, da confermare
-static const uint8_t PIN_SCL    = 3;
+static const uint8_t PIN_SDA    = 2;   // VL53L1X SDA
+static const uint8_t PIN_SCL    = 3;   // VL53L1X SCL
 static const uint8_t PIN_XSHUT  = 5;   // VL53L1X shutdown (LOW = laser spento)
 static const uint8_t PIN_RGB    = 8;   // WS2812B integrato
 static const uint8_t PIN_BOOT   = 9;   // tasto BOOT: tenuto 3 s = factory reset Zigbee

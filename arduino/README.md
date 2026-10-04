@@ -30,6 +30,19 @@ The [ESPHome firmware](../esphome/README.md) cannot expose parameters that are w
 - Status LED: blinking blue until the Zigbee join, steady green for 5 s, then off
 - Factory reset: hold the BOOT button for 3 s
 
+## Pinout used by the firmware
+
+| GPIO | Function |
+| :--- | :--- |
+| 1 | Battery voltage (ADC1_CH0, 100k/100k divider with 100 nF capacitor) |
+| 2 | VL53L1X SDA (`Wire.begin(2, 3)`) |
+| 3 | VL53L1X SCL |
+| 5 | VL53L1X XSHUT (laser off during deep sleep) |
+| 8 | Onboard WS2812B status LED |
+| 9 | BOOT button (factory reset when held 3 s) |
+
+Wiring details are in the [main README](../README.md#-wiring-list).
+
 ## Layout
 
 ```
@@ -97,6 +110,5 @@ If the board is not detected: unplug the USB cable, press and hold the onboard *
 
 ## Open points
 
-- **I2C pins**: the sketch uses SDA GPIO 2 and SCL GPIO 3 (`PIN_SDA`, `PIN_SCL`), the main README and the ESPHome config use GPIO 6 and 7. Confirm the real wiring and align the documentation.
-- **Status LED**: the main README suggests removing the onboard WS2812B to save about 1 mA in sleep; this firmware uses it during the Zigbee join.
+- **Status LED**: the onboard WS2812B draws about 1 mA even when off, so the deep sleep target (under 10 µA) is only reachable if the LED is removed. The firmware works either way; without the LED you only lose the pairing feedback.
 - **Home Assistant**: the custom cluster and the Time cluster need a ZHA quirk or a Zigbee2MQTT external converter to show up as entities.
