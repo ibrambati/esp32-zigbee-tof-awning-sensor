@@ -1,25 +1,51 @@
-# ESPHome Zigbee ToF Awning Sensor
+# ESP32 Zigbee ToF Awning Sensor
 
-A smart, low-power, battery-operated distance sensor designed to monitor and control motorized garden awnings in real-time. 
+A smart, low-power, battery-operated distance sensor designed to monitor and control motorized garden awnings in real-time.
 
-By utilizing the **VL53L1X Time-of-Flight (ToF) laser sensor** combined with an **ESP32-H2 / ESP32-C6** microcontroller running **ESPHome via Zigbee (Zigbee2MQTT/ZHA)**, this project exposes the exact opening percentage directly to **Home Assistant**, even if your awning uses local wall switches or standard dry-contact relays.
+By utilizing the **VL53L1X Time-of-Flight (ToF) laser sensor** combined with an **ESP32-H2 / ESP32-C6** microcontroller speaking **Zigbee (Zigbee2MQTT/ZHA)**, this project exposes the exact opening percentage directly to **Home Assistant**, even if your awning uses local wall switches or standard dry-contact relays.
 
 ### 🔋 Key Features
-* **100% Wireless & Smart Power Management:** Optimized for battery operation with a custom daylight-conditioned Deep Sleep logic to prevent battery drain at night.
+* **100% Wireless & Smart Power Management:** Optimized for battery operation with a deep sleep duty cycle to keep battery drain minimal.
 * **ToF Precision:** Measures the exact distance between the awning body and the front bar, converting raw millimeters into an accurate 0-100% position entity.
-* **Fully Dynamic Configuration:** Calibration points (zero position and max length), sleep duration, and laser poll intervals are exposed as entities and can be modified on-the-fly directly from Home Assistant without reflashing.
+* **Configurable Calibration:** Calibration points (zero position and max length), sleep duration and laser poll interval are configurable. With the ESPHome firmware they are compile-time defaults; the Arduino firmware aims to make them writable over Zigbee, without reflashing.
+
+## 🧩 Two Firmware Options
+
+The hardware is the same; pick the firmware that fits your needs.
+
+| Folder | Framework | Status | Remote configuration over Zigbee |
+| :--- | :--- | :--- | :--- |
+| [`esphome/`](esphome/README.md) | ESPHome (ESP-IDF) | Available | No: calibration and sleep values are set at compile time |
+| [`arduino/`](arduino/README.md) | Arduino-ESP32 (`arduino-cli`) | Work in progress (skeleton) | Goal of this firmware |
+
+Repository layout:
+
+```
+.
+├── README.md     # this file: hardware, BOM, wiring
+├── docs/         # photos, schematics, datasheets
+├── esphome/      # ESPHome firmware + README
+└── arduino/      # Arduino firmware, build setup + README
+```
 
 ## 📦 Bill of Materials (BOM)
 
 | Component | Description | Qty | Notes |
 | :--- | :--- | :--- | :--- |
 | **Home Assistant** | Central smart home server | 1 | The main automation hub |
-| **ESPHome & Zigbee2MQTT** | Firmware framework & Zigbee bridge | 1 | Handles local logic and Zigbee communication |
+| **Zigbee2MQTT / ZHA** | Zigbee bridge / coordinator | 1 | Handles Zigbee communication with the sensor |
+| **ESPHome** *or* **Arduino-ESP32** | Firmware framework | 1 | See [Two Firmware Options](#-two-firmware-options) |
 | **Waveshare ESP32-H2-Zero** | Ultra-compact Zigbee microcontroller | 1 | Based on the ESP32-H2FH4S chip with ceramic antenna |
 | **VL53L1X** | Time-of-Flight (ToF) laser distance sensor | 1 | Range up to 4 meters (Long Mode) |
 | **TP4056H Charging Module** | USB-C Li-Ion battery charger with protection | 1 | Must include double protection (6 pads, e.g., HW-107) |
 | **18650 Li-Ion Battery** | 3.7V ricaricabile cell (3200 mAh) | 1 | *Unprotected* (flat top) model recommended for outdoors |
 | **100kΩ Resistors** | Carbon or metal film resistors | 2 | 1% tolerance for the ADC voltage divider |
+
+### Hardware photos
+
+| ESP32-H2-Zero | VL53L1X |
+| :---: | :---: |
+| ![Waveshare ESP32-H2-Zero](docs/Waveshare%20ESP32-H2-Zero.jpg) | ![VL53L1X](docs/VL53L1X.jpg) |
 
 ---
 
@@ -62,28 +88,11 @@ All grounds must merge into a single logical point (**Common GND**). Follow this
 
 ---
 
-## ⚡ How to Flash via ESPHome
+## ⚡ Firmware
 
-The ESP32-H2-Zero uses a native **USB Type-C port** (USB CDC) managed directly by the main chip without a dedicated UART chip. Follow these steps for the first-time compilation and flashing:
+Once the hardware is assembled, flash one of the two firmwares:
 
-### 1. Environment Preparation
-1. Open your **Home Assistant** instance and go to the **ESPHome** dashboard.
-2. Click **New Device** and name it (e.g., `esphome-zigbee-tof-awning-sensor`).
-3. Pick **ESP32** as the platform. When prompted, make sure to select the `esp-idf` framework (required for native Zigbee support on H2/C6 chips).
-4. Copy the YAML configuration code provided in this repository and save it.
+* **[ESPHome firmware](esphome/README.md)**: YAML configuration, flashing via the ESPHome dashboard / web tool, pairing with Zigbee2MQTT or ZHA. Settings are fixed at compile time.
+* **[Arduino firmware](arduino/README.md)**: `arduino-cli` project with build and flash instructions. Work in progress, aimed at parameters writable over Zigbee.
 
-### 2. Initial Wired Flashing (Web Method)
-Since the ESP32-H2 uses Zigbee instead of Wi-Fi, the initial flash must be done via a USB cable:
-1. Connect the ESP32-H2-Zero to your PC using a proper USB-C data cable.
-2. Inside ESPHome, click the three dots on your device and select **Install** ──► **Manual Download**.
-3. Wait for compilation to finish. Once done, download the **Factory (`.bin`)** file.
-4. Go to the official [ESPHome Web tool](https://esphome.io) using a Chromium-based browser (Chrome or Edge).
-5. Click **Connect** and pick the COM port linked to the board (it will show up as *USB JTAG/serial debug unit*).
-   * ⚠️ *If the board isn't detected:* Unplug the USB cable, press and hold the tiny onboard **BOOT** button, plug the cable back in, and release the button. Now try connecting again.
-6. Select the downloaded `.bin` file and click **Install**. Wait for the process to complete.
-
-### 3. Pairing with Zigbee2MQTT / ZHA
-After flashing, the board will automatically reboot and start in Zigbee pairing mode:
-1. Open your **Zigbee2MQTT** dashboard in Home Assistant.
-2. Click **Permit Join (All)**.
-3. Within a few seconds, the laser sensor will be discovered as a new Zigbee node, instantly exposing all 9 configured entities to your smart home.
+In both cases the ESP32-H2-Zero is flashed over its native **USB Type-C port** the first time, since it speaks Zigbee and not Wi-Fi.
