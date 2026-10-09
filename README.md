@@ -7,7 +7,7 @@ By utilizing the **VL53L1X Time-of-Flight (ToF) laser sensor** combined with an 
 ### 🔋 Key Features
 * **100% Wireless & Smart Power Management:** Optimized for battery operation with a deep sleep duty cycle to keep battery drain minimal.
 * **ToF Precision:** Measures the exact distance between the awning body and the front bar, converting raw millimeters into an accurate 0-100% position entity.
-* **Configurable Calibration:** Calibration points (zero position and max length), sleep duration and laser poll interval are configurable. With the ESPHome firmware they are compile-time defaults; the Arduino firmware aims to make them writable over Zigbee, without reflashing.
+* **Configurable Calibration:** Calibration points (zero position and max length), sleep settings and laser poll interval are configurable. With the ESPHome firmware they are compile-time defaults; the Arduino firmware makes them writable over Zigbee (Zigbee2MQTT) and stores them in flash, without reflashing.
 
 ## 🧩 Two Firmware Options
 
@@ -16,7 +16,7 @@ The hardware is the same; pick the firmware that fits your needs.
 | Folder | Framework | Status | Remote configuration over Zigbee |
 | :--- | :--- | :--- | :--- |
 | [`esphome/`](esphome/README.md) | ESPHome (ESP-IDF) | Available | No: calibration and sleep values are set at compile time |
-| [`arduino/`](arduino/README.md) | Arduino-ESP32 (`arduino-cli`) | Work in progress (first draft, untested) | Yes: writable Zigbee attributes stored in NVS |
+| [`arduino/`](arduino/README.md) | Arduino-ESP32 (`arduino-cli`) | Work in progress (hardware-specific tweaks already in, not yet considered stable) | Yes: writable Zigbee attributes stored in NVS, exposed in Zigbee2MQTT by the converter in [`z2m/`](z2m/awning_tof.mjs) |
 
 Repository layout:
 
@@ -25,7 +25,8 @@ Repository layout:
 ├── README.md     # this file: hardware, BOM, wiring
 ├── docs/         # photos, schematics, datasheets
 ├── esphome/      # ESPHome firmware + README
-└── arduino/      # Arduino firmware, build setup + README
+├── arduino/      # Arduino firmware, build setup + README
+└── z2m/          # Zigbee2MQTT external converter for the Arduino firmware
 ```
 
 ## 📦 Bill of Materials (BOM)
@@ -33,7 +34,7 @@ Repository layout:
 | Component | Description | Qty | Notes |
 | :--- | :--- | :--- | :--- |
 | **Home Assistant** | Central smart home server | 1 | The main automation hub |
-| **Zigbee2MQTT / ZHA** | Zigbee bridge / coordinator | 1 | Handles Zigbee communication with the sensor |
+| **Zigbee2MQTT / ZHA** | Zigbee bridge / coordinator | 1 | Handles Zigbee communication with the sensor. The Arduino firmware's custom cluster needs the Zigbee2MQTT converter in [`z2m/`](z2m/awning_tof.mjs); no ZHA quirk is provided yet |
 | **ESPHome** *or* **Arduino-ESP32** | Firmware framework | 1 | See [Two Firmware Options](#-two-firmware-options) |
 | **Waveshare ESP32-H2-Zero** | Ultra-compact Zigbee microcontroller | 1 | Based on the ESP32-H2FH4S chip with ceramic antenna |
 | **VL53L1X** | Time-of-Flight (ToF) laser distance sensor | 1 | Range up to 4 meters (Long Mode) |
@@ -61,9 +62,10 @@ According to the official specs of the [Waveshare ESP32-H2-Zero](https://wavesha
 | **GPIO 3** | GPIO | Connected to **`SCL`** of the VL53L1X | I2C Clock line for the laser sensor |
 | **GPIO 5** | MTMS / GPIO | Connected to **`XSHUT`** of the VL53L1X | Shutdown control pin to turn off the laser in Deep Sleep |
 | **GPIO 1** | ADC1_CH0 / GPIO | Connected to the center of the divider | Analog pin used to measure battery voltage |
-| **GPIO 8** | Onboard WS2812B | Status LED, no external wiring | Arduino firmware: blinking blue while joining Zigbee, steady green for 5 s once paired, then off |
+| **GPIO 8** | Onboard WS2812B | Status LED, no external wiring | Arduino firmware: blue while joining Zigbee, then green according to the `ledMode` setting (always on by default, blinking, or on for 5 s at boot only) |
+| **GPIO 9** | BOOT button | Onboard button, no external wiring | Arduino firmware: hold for 3 s to factory reset the Zigbee pairing |
 
-> 💡 **Power Saving Tip:** To fully eliminate parasitic power drain during Deep Sleep, it is highly recommended to desolder or cut the trace of the onboard **WS2812B** RGB LED. Otherwise, it will continuously draw around 1mA even when the chip is asleep. The Arduino firmware uses this LED for the pairing feedback: if you remove it, you only lose the status light.
+> 💡 **Power Saving Tip:** To fully eliminate parasitic power drain during Deep Sleep, it is highly recommended to desolder or cut the trace of the onboard **WS2812B** RGB LED. Otherwise, it will continuously draw around 1mA even when the chip is asleep. The Arduino firmware uses this LED for the pairing feedback: if you remove it, you only lose the status light. If you keep it, set `ledMode` to `boot-only`: the default (`always-on`) keeps the LED lit after pairing and costs battery.
 
 ---
 
@@ -94,6 +96,6 @@ All grounds must merge into a single logical point (**Common GND**). Follow this
 Once the hardware is assembled, flash one of the two firmwares:
 
 * **[ESPHome firmware](esphome/README.md)**: YAML configuration, flashing via the ESPHome dashboard / web tool, pairing with Zigbee2MQTT or ZHA. Settings are fixed at compile time.
-* **[Arduino firmware](arduino/README.md)**: `arduino-cli` project with build and flash instructions. First draft, aimed at parameters writable over Zigbee.
+* **[Arduino firmware](arduino/README.md)**: `arduino-cli` project with build and flash instructions, parameters writable over Zigbee and the Zigbee2MQTT converter setup. Still work in progress.
 
 In both cases the ESP32-H2-Zero is flashed over its native **USB Type-C port** the first time, since it speaks Zigbee and not Wi-Fi.
