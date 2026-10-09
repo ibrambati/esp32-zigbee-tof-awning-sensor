@@ -4,11 +4,44 @@ Arduino-ESP32 flavour of the [ESP32 Zigbee ToF Awning Sensor](../README.md). Har
 
 ## Why this version exists
 
-The [ESPHome firmware](../esphome/README.md) cannot expose parameters that are writable over Zigbee (Zigbee `number` entities are not supported on ESP32). This firmware is meant to fill that gap: calibration (closed zero, max length), deep sleep duration and laser poll interval should become writable Zigbee attributes, so they can be changed from Home Assistant / Zigbee2MQTT without reflashing.
+The [ESPHome firmware](../esphome/README.md) cannot expose parameters that are writable over Zigbee (Zigbee `number` entities are not supported on ESP32). This firmware fills that gap: calibration (closed zero, max length), sleep window and laser poll interval are writable Zigbee attributes, stored in NVS, so they can be changed from Home Assistant / Zigbee2MQTT without reflashing.
 
 ## Status
 
-**Work in progress.** [`awning_sensor/awning_sensor.ino`](awning_sensor/awning_sensor.ino) is a compilable skeleton: pin mapping and default values are in place, while the Zigbee end device, the VL53L1X driver and the deep sleep cycle are still TODO.
+**First draft, not yet compiled or tested on hardware.** [`esp32_zigbee_awning/esp32_zigbee_awning.ino`](esp32_zigbee_awning/esp32_zigbee_awning.ino) implements the full feature set below. Some calls of the Arduino-ESP32 Zigbee API depend on the core version; they are marked `[V1]`, `[V2]`, `[V3]` in the source and are the first things to check when compiling.
+
+## Features
+
+- Zigbee end device, one endpoint (10) exposed as **Window Covering** (cluster `0x0102`, `CurrentPositionLiftPercentage` `0x0008`)
+- **Power Configuration** (`0x0001`): battery voltage and percentage
+- **Time** client (`0x000A`): asks the coordinator for the network time and syncs the internal clock
+- **Custom cluster** `0xFC00` with writable attributes, persisted in NVS (`Preferences`):
+
+  | Attribute | Meaning | Default |
+  | :--- | :--- | :--- |
+  | `0x0000` | Awning closed position zero (cm) | 20 |
+  | `0x0001` | Awning max length (cm) | 220 |
+  | `0x0002` | Deep sleep start hour | 20 |
+  | `0x0003` | Deep sleep end hour | 7 |
+  | `0x0004` | Laser read interval (ms), extra attribute | 500 |
+
+- **Daytime**: CPU awake, laser read every interval, report only when the distance changes by 2 cm or more
+- **Night**: laser off through XSHUT (GPIO 5), then a single deep sleep until the end hour
+- Status LED: blinking blue until the Zigbee join, steady green for 5 s, then off
+- Factory reset: hold the BOOT button for 3 s
+
+## Pinout used by the firmware
+
+| GPIO | Function |
+| :--- | :--- |
+| 1 | Battery voltage (ADC1_CH0, 100k/100k divider with 100 nF capacitor) |
+| 2 | VL53L1X SDA (`Wire.begin(2, 3)`) |
+| 3 | VL53L1X SCL |
+| 5 | VL53L1X XSHUT (laser off during deep sleep) |
+| 8 | Onboard WS2812B status LED |
+| 9 | BOOT button (factory reset when held 3 s) |
+
+Wiring details are in the [main README](../README.md#-wiring-list).
 
 ## Layout
 
@@ -16,15 +49,15 @@ The [ESPHome firmware](../esphome/README.md) cannot expose parameters that are w
 arduino/
 ├── README.md
 ├── .gitignore
-└── awning_sensor/        # sketch folder (name must match the .ino file)
-    ├── awning_sensor.ino
-    └── sketch.yaml       # default FQBN and board options
+└── esp32_zigbee_awning/        # sketch folder (name must match the .ino file)
+    ├── esp32_zigbee_awning.ino
+    └── sketch.yaml             # default FQBN and board options
 ```
 
 ## Toolchain
 
-- [`arduino-cli`](https://arduino.github.io/arduino-cli/)
-- Arduino-ESP32 core (`esp32:esp32`) with ESP32-H2 Zigbee support
+- [`arduino-cli`](https://arduino.github.io/arduino-cli/) or the Arduino IDE
+- Arduino-ESP32 core (`esp32:esp32`) with ESP32-H2 Zigbee support (3.1.x or newer)
 
 Setup (once):
 
@@ -35,11 +68,11 @@ arduino-cli core update-index
 arduino-cli core install esp32:esp32
 ```
 
-The core version used for the first successful build has not been pinned yet; it will be recorded here once the firmware compiles with the Zigbee stack.
+The core version used for the first successful build has not been pinned yet; it will be recorded here once the firmware compiles.
 
 ## Board options
 
-[`sketch.yaml`](awning_sensor/sketch.yaml) sets the default FQBN:
+[`sketch.yaml`](esp32_zigbee_awning/sketch.yaml) sets the default FQBN:
 
 ```
 esp32:esp32:esp32h2:ZigbeeMode=ed,PartitionScheme=zigbee
@@ -48,7 +81,15 @@ esp32:esp32:esp32h2:ZigbeeMode=ed,PartitionScheme=zigbee
 - `ZigbeeMode=ed`: Zigbee end device (battery powered)
 - `PartitionScheme=zigbee`: Zigbee 4MB with spiffs (the ESP32-H2FH4S has 4 MB of flash)
 
-If you do not see `Serial` output over the USB-C port, enable the *USB CDC On Boot* board option for the H2.
+In the Arduino IDE set the same options under *Tools*. If you do not see `Serial` output over the USB-C port, enable *USB CDC On Boot*.
+
+## Libraries
+
+- SparkFun VL53L1X 4m Laser Distance Sensor (`SparkFun_VL53L1X.h`):
+
+```bash
+arduino-cli lib install "SparkFun VL53L1X 4m Laser Distance Sensor"
+```
 
 ## Build and flash
 
@@ -56,10 +97,10 @@ From the repository root:
 
 ```bash
 # Compile
-arduino-cli compile arduino/awning_sensor
+arduino-cli compile arduino/esp32_zigbee_awning
 
 # Upload (replace the port, e.g. /dev/ttyACM0 or COM5)
-arduino-cli upload -p /dev/ttyACM0 arduino/awning_sensor
+arduino-cli upload -p /dev/ttyACM0 arduino/esp32_zigbee_awning
 
 # Serial monitor
 arduino-cli monitor -p /dev/ttyACM0 -c baudrate=115200
@@ -67,6 +108,7 @@ arduino-cli monitor -p /dev/ttyACM0 -c baudrate=115200
 
 If the board is not detected: unplug the USB cable, press and hold the onboard **BOOT** button, plug the cable back in, release the button and retry.
 
-## Libraries
+## Open points
 
-The VL53L1X driver library has not been chosen yet. Once selected, it will be listed here with its install command (`arduino-cli lib install ...`).
+- **Status LED**: the onboard WS2812B draws about 1 mA even when off, so the deep sleep target (under 10 µA) is only reachable if the LED is removed. The firmware works either way; without the LED you only lose the pairing feedback.
+- **Home Assistant**: the custom cluster and the Time cluster need a ZHA quirk or a Zigbee2MQTT external converter to show up as entities.
