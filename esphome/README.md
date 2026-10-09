@@ -18,7 +18,7 @@ Exposed over Zigbee (each sensor on its own endpoint):
 
 The calibration values (closed zero, max length), the deep sleep duration and the laser poll interval are defined as `globals` and `number` template entities, but **Zigbee `number` entities are not supported by ESPHome on ESP32**, and this firmware has no Wi-Fi/API path either. In practice they only act as defaults: to change them, edit `initial_value` in the YAML and reflash.
 
-If you need these parameters to be settable from Home Assistant / Zigbee2MQTT without reflashing, use the [Arduino firmware](../arduino/README.md) instead (work in progress).
+If you need these parameters to be settable from Home Assistant / Zigbee2MQTT without reflashing, use the [Arduino firmware](../arduino/README.md) instead (work in progress, to be used with Zigbee2MQTT and the converter in [`z2m/`](../z2m/awning_tof.mjs)).
 
 ## How to flash
 
