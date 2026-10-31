@@ -25,6 +25,11 @@ const T = Zcl.DataType;
 
 const attr = (name, ID, type, write = false) => ({name, ID, type, write});
 
+// Decimali delle misure. Zigbee2MQTT non inoltra la `precision` delle exposes a Home Assistant e
+// HA applica i propri default per device_class (0 decimali per V e cm), quindi la stessa
+// precisione viene passata anche come `suggested_display_precision` nella discovery MQTT.
+const PRECISION = {distance: 1, voltage: 2};
+
 const awningCluster = m.deviceAddCustomCluster(CLUSTER, {
     name: CLUSTER,
     ID: 0xfc00,
@@ -73,7 +78,7 @@ export default {
             attribute: 'distanceMm',
             unit: 'cm',
             scale: 10,
-            precision: 1,
+            precision: PRECISION.distance,
             access: 'STATE',
         }),
 
@@ -87,7 +92,7 @@ export default {
             attribute: 'batteryMv',
             unit: 'V',
             scale: 1000,
-            precision: 2,
+            precision: PRECISION.voltage,
             access: 'STATE',
             entityCategory: 'diagnostic',
         }),
@@ -192,5 +197,11 @@ export default {
 
         m.identify({isSleepy: true}),
     ],
+    meta: {
+        overrideHaDiscoveryPayload: (payload) => {
+            const property = payload.value_template?.match(/value_json\["(\w+)"\]/)?.[1];
+            if (Object.hasOwn(PRECISION, property ?? "")) payload.suggested_display_precision = PRECISION[property];
+        },
+    },
     // linkquality viene esposta automaticamente da Zigbee2MQTT
 };
