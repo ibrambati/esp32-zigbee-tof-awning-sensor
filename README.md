@@ -63,7 +63,7 @@ According to the official specs of the [Waveshare ESP32-H2-Zero](https://wavesha
 | **GPIO 3** | GPIO | Connected to **`SCL`** of the VL53L1X | I2C Clock line for the laser sensor |
 | **GPIO 5** | MTMS / GPIO | Connected to **`XSHUT`** of the VL53L1X | Shutdown control pin to turn off the laser in Deep Sleep |
 | **GPIO 1** | ADC1_CH0 / GPIO | Connected to the center of the divider | Analog pin used to measure battery voltage |
-| **GPIO 7** | LP GPIO | Connected to the center of the charger divider | Arduino firmware: high when the TP4056H USB input is powered (charger connected), also wakes the board from deep sleep |
+| **GPIO 10** | LP GPIO | Connected to the center of the charger divider | Arduino firmware: high when the TP4056H USB input is powered (charger connected), also wakes the board from deep sleep |
 | **GPIO 8** | Onboard WS2812B | Status LED, no external wiring | Arduino firmware: blue while joining Zigbee, then green according to the `ledMode` setting (always on by default, blinking, or on for 5 s at boot only) |
 | **GPIO 9** | BOOT button | Onboard button, no external wiring | Arduino firmware: hold for 3 s to factory reset the Zigbee pairing |
 
@@ -92,10 +92,10 @@ All grounds must merge into a single logical point (**Common GND**). Follow this
    * Output of R2 ──► **Common GND** (`OUT-`)
 
 4. **Charger Detection Divider (Arduino firmware):**
-   * **`IN+`** pad on the TP4056H (USB 5V) ──► Input of a 100kΩ resistor (**R4**)
-   * Output of R4 ──► Input of a 150kΩ resistor (**R5**) **AND** **`GPIO 7`** pin on the ESP32-H2-Zero
-   * Output of R5 ──► **Common GND**
-   * With 5 V on `IN+` the pin sees about 3.0 V (logic high); without the charger R5 pulls it to 0 V, so no external pull-down is needed. The firmware disables the internal pull resistors: the internal pull-down (~45 kΩ) in parallel with R5 would drag the pin down to about 1.3 V
+   * **`IN+`** pad on the TP4056H (USB 5V) ──► Input of a 100kΩ resistor (**R3**)
+   * Output of R3 ──► Input of a 150kΩ resistor (**R4**) **AND** **`GPIO 10`** pin on the ESP32-H2-Zero
+   * Output of R4 ──► **Common GND**
+   * With 5 V on `IN+` the pin sees about 3.0 V (logic high); without the charger R4 pulls it to 0 V, so no external pull-down is needed. The firmware disables the internal pull resistors: the internal pull-down (~45 kΩ) in parallel with R4 would drag the pin down to about 1.3 V
 
 ---
 

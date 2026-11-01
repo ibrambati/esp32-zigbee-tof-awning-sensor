@@ -36,13 +36,13 @@ The [ESPHome firmware](../esphome/README.md) cannot expose parameters that are w
 - **Night**: only when night deep sleep is enabled (off by default) and the time has been synced. Laser off through XSHUT (GPIO 5, held low during sleep), then a single deep sleep until the end hour. If start and end hour are equal there is no night window
 - **Laser**: if the VL53L1X is not found, the initialization is retried every 15 s
 - **Battery**: 15 ADC samples averaged, divider compensated, multiplied by `VBAT_CAL` (calibration factor, default 1.0: set it to multimeter voltage / reported voltage), converted with a piecewise-linear Li-Ion curve (3.2 V empty, 4.2 V full) and reported every 10 minutes (every minute while the charger is connected)
-- **Charger and status**: the TP4056H does not expose its CHRG pin, so GPIO 7 reads the USB input through a divider (see the main README). The `Status` attribute is:
+- **Charger and status**: the TP4056H does not expose its CHRG pin, so GPIO 10 reads the USB input through a divider (see the main README). The `Status` attribute is:
   - `active` (0): running on battery
   - `deep sleep` (1): sent right before entering the night deep sleep; it stays until the next wake-up, because a sleeping device cannot transmit
   - `charging` (2): charger connected
   - `charge complete` (3): an estimate, not the charger's own signal: charger connected and battery at or above `VBAT_CHARGED` (4.15 V) for `CHARGED_CONFIRM_MS` (15 minutes). In the final constant-voltage phase "almost full" and "full" look the same from the voltage alone
 
-  While the charger is connected the battery percentage is not updated (the terminal voltage is inflated by the charge current), only the voltage is; at charge complete it is set to 100 %. After unplugging, the percentage resumes after `BATTERY_SETTLE_MS` (2 minutes). With the charger connected the board never enters the night deep sleep, and plugging the charger in during the night wakes it up (ext1 wake-up on GPIO 7)
+  While the charger is connected the battery percentage is not updated (the terminal voltage is inflated by the charge current), only the voltage is; at charge complete it is set to 100 %. After unplugging, the percentage resumes after `BATTERY_SETTLE_MS` (2 minutes). With the charger connected the board never enters the night deep sleep, and plugging the charger in during the night wakes it up (ext1 wake-up on GPIO 10)
 - **Status LED**: blue while the Zigbee stack starts and joins, then green according to LED mode (always on, blinking, or only for 5 s after boot). The red and green channels are swapped on this board: `LED_RG_SWAPPED` in the sketch
 - **Join**: if no network is found after 10 minutes the board restarts and tries again
 - **Factory reset**: hold the BOOT button for 3 s, also while waiting for the join
@@ -55,9 +55,9 @@ The [ESPHome firmware](../esphome/README.md) cannot expose parameters that are w
 | 2 | VL53L1X SDA (`Wire.begin(2, 3)`) |
 | 3 | VL53L1X SCL |
 | 5 | VL53L1X XSHUT (laser off during deep sleep) |
-| 7 | Charger detection (TP4056H `IN+` through a 100k/150k divider, high = USB connected, deep sleep wake-up) |
 | 8 | Onboard WS2812B status LED |
 | 9 | BOOT button (factory reset when held 3 s) |
+| 10 | Charger detection (TP4056H `IN+` through a 100k/150k divider, high = USB connected, deep sleep wake-up) |
 
 Wiring details are in the [main README](../README.md#-wiring-list).
 
@@ -145,6 +145,6 @@ Attribute IDs and types must stay identical in the sketch and in the converter: 
 - **Status LED**: the onboard WS2812B draws about 1 mA even when off, so the deep sleep target (under 10 µA) is only reachable if the LED is removed. The firmware works either way; without the LED you only lose the pairing feedback. With the default LED mode (always-on) the LED also stays lit after pairing: use `boot-only` to save battery.
 - **Radio idle mode**: the sketch currently sets `DIAG_RX_ON_IDLE` to 1, a diagnostic setting for the rejoin problem: the Zigbee radio stays always listening and the stack never sleeps, which costs far more battery than a normal low-power end device. Setting it to 0 restores the low-power behaviour (`esp_zb_sleep_enable`) once the rejoin issue is solved.
 - **Deep sleep**: night deep sleep is disabled by default and needs a synced clock. While the chip sleeps the sensor does not answer and the USB port disappears until wake-up.
-- **Charger detection**: not yet verified on the real board. In particular the ext1 wake-up on GPIO 7 relies on the pin keeping the internal pull resistors disabled during deep sleep; if plugging the charger in does not wake the board, it still detects the charger at the next timed wake-up. `VBAT_CAL` also needs to be measured, otherwise with a divider/ADC reading below the real voltage the 4.15 V threshold may never be reached and `charge complete` never shows up
+- **Charger detection**: not yet verified on the real board. In particular the ext1 wake-up on GPIO 10 relies on the pin keeping the internal pull resistors disabled during deep sleep; if plugging the charger in does not wake the board, it still detects the charger at the next timed wake-up. `VBAT_CAL` also needs to be measured, otherwise with a divider/ADC reading below the real voltage the 4.15 V threshold may never be reached and `charge complete` never shows up
 - **Home Assistant with ZHA**: only a Zigbee2MQTT converter exists; the custom cluster and the Time cluster would need a ZHA quirk to show up as entities.
 - **Time zone**: hard-coded to Italy, edit `TZ_STRING` in the sketch for other regions.
