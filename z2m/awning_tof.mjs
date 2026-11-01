@@ -6,6 +6,7 @@
  *
  * Il cluster custom 0xFC00 deve coincidere con il firmware (ID e tipi degli attributi):
  *   sola lettura  0x0010 distanza (mm, U16)   0x0011 apertura (%, U8)   0x0012 tensione batteria (mV, U16)
+ *                 0x0013 stato (U8: 0 attivo, 1 deep sleep, 2 in carica, 3 carica completa)
  *   scrittura     0x0000 zero tenda chiusa (cm)   0x0001 lunghezza massima (cm)
  *                 0x0002 ora inizio deep sleep    0x0003 ora fine deep sleep   0x0004 intervallo lettura (ms)
  *                 0x0005 modalita LED (0 always-on, 1 blink, 2 boot-only)
@@ -45,6 +46,7 @@ const awningCluster = m.deviceAddCustomCluster(CLUSTER, {
         distanceMm: attr('distanceMm', 0x0010, T.UINT16),
         openPercent: attr('openPercent', 0x0011, T.UINT8),
         batteryMv: attr('batteryMv', 0x0012, T.UINT16),
+        status: attr('status', 0x0013, T.UINT8),
     },
     commands: {},
     commandsResponse: {},
@@ -95,6 +97,18 @@ export default {
             precision: PRECISION.voltage,
             access: 'STATE',
             entityCategory: 'diagnostic',
+        }),
+        m.enumLookup({
+            name: 'status',
+            label: 'Stato',
+            description:
+                'attivo = a batteria e sveglio; deep_sleep = addormentato (inviato prima di dormire, resta fino al risveglio); ' +
+                'in_carica = caricatore USB collegato; carica_completa = stima: batteria sopra 4,15 V da almeno 15 minuti con il caricatore collegato. ' +
+                'In carica la percentuale batteria non viene aggiornata (la tensione si)',
+            cluster: CLUSTER,
+            attribute: 'status',
+            lookup: {attivo: 0, deep_sleep: 1, in_carica: 2, carica_completa: 3},
+            access: 'STATE',
         }),
 
         // ---- parametri (scrivibili da Home Assistant, salvati in NVS dal firmware) ----

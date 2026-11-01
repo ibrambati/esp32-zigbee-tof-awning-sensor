@@ -21,6 +21,7 @@
  *  0xFC00 Custom (server), tutti gli attributi sono anche riportati al coordinatore:
  *     sola lettura: 0x0010 DistanceMm (U16, mm)      0x0011 OpenPercent (U8, %)
  *                   0x0012 BatteryMv  (U16, mV)
+ *                   0x0013 Status     (U8: 0 attivo, 1 deep sleep, 2 in carica, 3 carica completa)
  *     scrittura:    0x0000 ClosedPositionZero (U16, cm)  0x0001 MaxLength (U16, cm)
  *                   0x0002 SleepStartHour (U8)           0x0003 SleepEndHour (U8)
  *                   0x0004 ReadIntervalMs (U16)      0x0005 LedMode (U8: 0 always-on, 1 blink, 2 boot-only)
@@ -47,6 +48,7 @@ static const uint8_t PIN_VBAT   = 1;   // ADC1_CH0, partitore 100k/100k + 100nF
 static const uint8_t PIN_SDA    = 2;   // VL53L1X SDA
 static const uint8_t PIN_SCL    = 3;   // VL53L1X SCL
 static const uint8_t PIN_XSHUT  = 5;   // VL53L1X shutdown (LOW = laser spento)
+static const uint8_t PIN_VIN    = 7;   // presenza caricatore: V_IN del TP4056 con partitore 100k/150k (alto = USB collegato)
 static const uint8_t PIN_RGB    = 8;   // WS2812B integrato
 static const uint8_t PIN_BOOT   = 9;   // tasto BOOT: tenuto 3 s = factory reset Zigbee
 
@@ -64,8 +66,10 @@ enum : uint16_t {
   ATTR_SENSOR_ENABLED = 0x0007,  // 1 = laser acceso (default), 0 = spento via XSHUT (debug)
   ATTR_DIST_MM     = 0x0010,   // sola lettura
   ATTR_OPEN_PCT    = 0x0011,   // sola lettura
-  ATTR_VBAT_MV     = 0x0012    // sola lettura
+  ATTR_VBAT_MV     = 0x0012,   // sola lettura
+  ATTR_STATUS      = 0x0013    // sola lettura, valori STATUS_*
 };
+enum : uint8_t { STATUS_ACTIVE = 0, STATUS_DEEP_SLEEP = 1, STATUS_CHARGING = 2, STATUS_CHARGED = 3 };
 static const uint16_t COORD_SHORT_ADDR = 0x0000;   // il coordinatore e' sempre 0x0000
 static const uint8_t  COORD_ENDPOINT   = 1;
 static const uint16_t ATTR_BATT_PCT_REMAINING = 0x0021;  // ZCL Power Config: batteryPercentageRemaining
@@ -79,6 +83,12 @@ static const uint8_t  ADC_SAMPLES      = 15;
 static const bool     INVERT_PERCENT   = false;        // true se in HA risulta invertita
 static const float    VBAT_EMPTY       = 3.2f;
 static const float    VBAT_FULL        = 4.2f;
+static const float    VBAT_CAL         = 1.0f;         // correzione partitore/ADC: tensione multimetro / tensione letta
+static const float    VBAT_CHARGED     = 4.15f;        // in carica, sopra questa soglia si conta la fine carica
+static const uint32_t CHARGED_CONFIRM_MS = 15UL * 60 * 1000;  // ...per almeno 15 minuti di fila
+static const uint32_t BATTERY_INTERVAL_MS          = 600000UL;   // lettura batteria a batteria: 10 min
+static const uint32_t BATTERY_INTERVAL_CHARGING_MS = 60000UL;    // con caricatore collegato: 1 min
+static const uint32_t BATTERY_SETTLE_MS            = 120000UL;   // dopo lo stacco del caricatore la % aspetta 2 min
 enum : uint8_t { LED_ALWAYS_ON = 0, LED_BLINK = 1, LED_BOOT_ONLY = 2 };   // parametro ledMode
 static const uint32_t LED_BOOT_MS      = 5000;         // durata del verde in modalita' "boot-only"
 
@@ -201,7 +211,7 @@ float readBatteryVolts() {
     delay(1);
   }
   float mv = sum / (float)ADC_SAMPLES;
-  return (mv * 2.0f) / 1000.0f;                  // partitore 1:2
+  return (mv * 2.0f) / 1000.0f * VBAT_CAL;       // partitore 1:2
 }
 
 uint8_t batteryPercent(float v) {
@@ -217,6 +227,38 @@ uint8_t batteryPercent(float v) {
     }
   }
   return 100;
+}
+
+// ===================== CARICATORE =====================
+// Il TP4056 non espone il pin CHRG: la presenza dell'USB si legge da V_IN (partitore su GPIO7) e la
+// fine carica si deduce dalla tensione (sopra VBAT_CHARGED per CHARGED_CONFIRM_MS). Stima, non il
+// segnale del chip: nella fase finale a 4,2 V "quasi carica" e "carica" non si distinguono.
+bool     chargerConnected = false;
+uint32_t chargedSinceMs   = 0;    // prima lettura >= VBAT_CHARGED con caricatore collegato (0 = nessuna)
+uint32_t chargerRemovedMs = 0;    // istante dello stacco del caricatore (0 = mai staccato da questo boot)
+
+// Pull interni disattivati: il pull-down (~45k) in parallelo ai 150k del partitore porterebbe il pin a ~1,3 V (basso).
+void configureChargerPin() {
+  pinMode(PIN_VIN, INPUT);
+  gpio_pullup_dis((gpio_num_t)PIN_VIN);
+  gpio_pulldown_dis((gpio_num_t)PIN_VIN);
+}
+
+// Ritorna true se lo stato del caricatore e' cambiato.
+bool updateCharger() {
+  bool now = digitalRead(PIN_VIN) == HIGH;
+  if (now == chargerConnected) return false;
+  chargerConnected = now;
+  chargedSinceMs = 0;
+  if (!now) chargerRemovedMs = millis() | 1;
+  Serial.println(now ? "Caricatore collegato" : "Caricatore scollegato");
+  return true;
+}
+
+uint8_t currentStatus() {
+  if (!chargerConnected) return STATUS_ACTIVE;
+  if (chargedSinceMs && millis() - chargedSinceMs >= CHARGED_CONFIRM_MS) return STATUS_CHARGED;
+  return STATUS_CHARGING;
 }
 
 // ===================== ENDPOINT ZIGBEE =====================
@@ -247,10 +289,15 @@ public:
   void publishDistanceMm(uint16_t mm) { publishCustom(ATTR_DIST_MM, &mm); }
   void publishOpenPercent(uint8_t p)  { publishCustom(ATTR_OPEN_PCT, &p); }
 
-  void publishBattery(float volts, uint8_t pct) {
+  void publishStatus(uint8_t st) { publishCustom(ATTR_STATUS, &st); }
+
+  // updatePct = false: si riporta solo la tensione e la percentuale resta all'ultimo valore valido
+  // (in carica la tensione ai morsetti e' gonfiata dalla corrente di carica).
+  void publishBattery(float volts, uint8_t pct, bool updatePct = true) {
     uint16_t mv = (uint16_t)roundf(volts * 1000.0f);
     publishCustom(ATTR_VBAT_MV, &mv);
     setBatteryVoltage((uint8_t)roundf(volts * 10.0f));   // cluster standard, unita' 100 mV
+    if (!updatePct) return;
     setBatteryPercentage(pct);                           // il core moltiplica per 2 (unita' ZCL)
     reportToCoordinator(ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG, ATTR_BATT_PCT_REMAINING);
   }
@@ -340,7 +387,7 @@ private:
   void addCustomCluster() {
     esp_zb_attribute_list_t *c = esp_zb_zcl_attr_list_create(CUSTOM_CLUSTER);
     uint16_t zero = cfg.zeroCm, mx = cfg.maxCm, itv = cfg.intervalMs, dist = 0, vbat = 0;
-    uint8_t  s = cfg.sleepStart, e = cfg.sleepEnd, pct = 0, lm = cfg.ledMode, se = cfg.sleepEnabled, sn = cfg.sensorEnabled;
+    uint8_t  s = cfg.sleepStart, e = cfg.sleepEnd, pct = 0, lm = cfg.ledMode, se = cfg.sleepEnabled, sn = cfg.sensorEnabled, st = STATUS_ACTIVE;
     const uint8_t rw = ESP_ZB_ZCL_ATTR_ACCESS_READ_WRITE | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING;
     const uint8_t ro = ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY  | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING;
     esp_zb_custom_cluster_add_custom_attr(c, ATTR_ZERO_CM,     ESP_ZB_ZCL_ATTR_TYPE_U16, rw, &zero);
@@ -354,6 +401,7 @@ private:
     esp_zb_custom_cluster_add_custom_attr(c, ATTR_DIST_MM,     ESP_ZB_ZCL_ATTR_TYPE_U16, ro, &dist);
     esp_zb_custom_cluster_add_custom_attr(c, ATTR_OPEN_PCT,    ESP_ZB_ZCL_ATTR_TYPE_U8,  ro, &pct);
     esp_zb_custom_cluster_add_custom_attr(c, ATTR_VBAT_MV,     ESP_ZB_ZCL_ATTR_TYPE_U16, ro, &vbat);
+    esp_zb_custom_cluster_add_custom_attr(c, ATTR_STATUS,      ESP_ZB_ZCL_ATTR_TYPE_U8,  ro, &st);
     esp_zb_cluster_list_add_custom_cluster(_cluster_list, c, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
   }
 
@@ -408,6 +456,8 @@ uint32_t secondsToSleepEnd(const tm &now) {
 void enterNightDeepSleep(uint32_t seconds) {
   Serial.printf("Deep sleep notturno per %lu s\n", (unsigned long)seconds);
   Serial.flush();
+  zbAwning.publishStatus(STATUS_DEEP_SLEEP);    // da addormentato non puo' trasmettere: lo dice prima
+  delay(500);                                   // tempo per far partire il report
   if (sensorOk) distanceSensor.stopRanging();
   digitalWrite(PIN_XSHUT, LOW);                 // laser spento
   gpio_hold_en((gpio_num_t)PIN_XSHUT);          // mantiene LOW durante il deep sleep
@@ -416,6 +466,13 @@ void enterNightDeepSleep(uint32_t seconds) {
 #endif
   ledOff();
   esp_sleep_enable_timer_wakeup((uint64_t)seconds * 1000000ULL);
+#if SOC_PM_SUPPORT_EXT1_WAKEUP
+  // Risveglio anche quando si collega il caricatore (GPIO7 e' un LP IO). ext1 e non gpio_wakeup:
+  // quest'ultimo con la configurazione di default attiva il pull-down interno e falserebbe il partitore.
+  gpio_pullup_dis((gpio_num_t)PIN_VIN);
+  gpio_pulldown_dis((gpio_num_t)PIN_VIN);
+  esp_sleep_enable_ext1_wakeup(1ULL << PIN_VIN, ESP_EXT1_WAKEUP_ANY_HIGH);
+#endif
   esp_deep_sleep_start();
 }
 
@@ -436,6 +493,8 @@ void setup() {
   pinMode(PIN_BOOT, INPUT_PULLUP);
   pinMode(PIN_XSHUT, OUTPUT);
   digitalWrite(PIN_XSHUT, LOW);   // laser spento finche' non serve
+  configureChargerPin();
+  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT1) Serial.println("Risveglio: caricatore collegato");
 
   // --- Zigbee ---
   zbAwning.buildClusters();                                  // dopo loadConfig(): attributi custom = valori NVS
@@ -506,15 +565,14 @@ void setup() {
     Serial.println("Sensore spento da switch (XSHUT LOW)");   // XSHUT e' gia' LOW da prima di Zigbee.begin()
   }
 
-  // prima misura batteria
-  float v = readBatteryVolts();
-  zbAwning.publishBattery(v, batteryPercent(v));
+  // la prima misura batteria e il primo stato li invia il loop (lastBatteryMs == 0, lastStatus == 255)
   zbAwning.publishConfig();   // allinea l'interfaccia ai valori salvati in NVS
 }
 
 // ===================== LOOP =====================
 uint32_t lastBatteryMs = 0;
 uint32_t bootPressStart = 0;
+uint8_t  lastStatus = 255;
 
 void loop() {
   if (cfgDirty) { cfgDirty = false; applyConfigChange(); }
@@ -529,8 +587,11 @@ void loop() {
     }
   } else bootPressStart = 0;
 
-  // --- Gestione fascia notturna ---
-  if (cfg.sleepEnabled && timeValid) {
+  // --- Caricatore: a ogni cambio rilegge subito la batteria ---
+  if (updateCharger()) lastBatteryMs = 0;
+
+  // --- Gestione fascia notturna (con il caricatore collegato resta sveglio: l'alimentazione c'e') ---
+  if (cfg.sleepEnabled && timeValid && !chargerConnected) {
     time_t now = time(nullptr);
     tm lt; localtime_r(&now, &lt);
     if (inSleepWindow(lt)) {
@@ -567,12 +628,29 @@ void loop() {
     }
   }
 
-  // --- Batteria ogni 10 minuti ---
-  if (millis() - lastBatteryMs > 600000UL || lastBatteryMs == 0) {
+  // --- Batteria: ogni 10 minuti, ogni minuto con il caricatore collegato ---
+  uint32_t batteryItv = chargerConnected ? BATTERY_INTERVAL_CHARGING_MS : BATTERY_INTERVAL_MS;
+  if (millis() - lastBatteryMs > batteryItv || lastBatteryMs == 0) {
     lastBatteryMs = millis();
     float v = readBatteryVolts();
-    zbAwning.publishBattery(v, batteryPercent(v));
-    Serial.printf("Batteria %.2f V (%u%%)\n", v, batteryPercent(v));
+    if (chargerConnected) {
+      if (v < VBAT_CHARGED) chargedSinceMs = 0;
+      else if (!chargedSinceMs) chargedSinceMs = millis() | 1;
+    }
+    // La % si aggiorna solo a batteria, dopo BATTERY_SETTLE_MS dallo stacco; a carica completa vale 100.
+    bool settled = !chargerRemovedMs || millis() - chargerRemovedMs > BATTERY_SETTLE_MS;
+    uint8_t pct = currentStatus() == STATUS_CHARGED ? 100 : batteryPercent(v);
+    bool pctValid = currentStatus() == STATUS_CHARGED || (!chargerConnected && settled);
+    zbAwning.publishBattery(v, pct, pctValid);
+    Serial.printf("Batteria %.2f V (%u%%%s)\n", v, pct, pctValid ? "" : ", non pubblicata");
+  }
+
+  // --- Stato: attivo / in carica / carica completa (deep sleep lo invia enterNightDeepSleep) ---
+  uint8_t st = currentStatus();
+  if (st != lastStatus) {
+    lastStatus = st;
+    zbAwning.publishStatus(st);
+    Serial.printf("Stato %u\n", st);
   }
 
   // --- Resync ora periodico ---

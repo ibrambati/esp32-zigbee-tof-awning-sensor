@@ -40,7 +40,8 @@ Repository layout:
 | **VL53L1X** | Time-of-Flight (ToF) laser distance sensor | 1 | Range up to 4 meters (Long Mode) |
 | **TP4056H Charging Module** | USB-C Li-Ion battery charger with protection | 1 | Must include double protection (6 pads, e.g., HW-107) |
 | **18650 Li-Ion Battery** | 3.7V ricaricabile cell (3200 mAh) | 1 | *Unprotected* (flat top) model recommended for outdoors |
-| **100kΩ Resistors** | Carbon or metal film resistors | 2 | 1% tolerance for the ADC voltage divider |
+| **100kΩ Resistors** | Carbon or metal film resistors | 3 | 1% tolerance: 2 for the battery voltage divider, 1 for the charger detection divider |
+| **150kΩ Resistor** | Carbon or metal film resistor | 1 | Charger detection divider (Arduino firmware) |
 
 ### Hardware photos
 
@@ -62,6 +63,7 @@ According to the official specs of the [Waveshare ESP32-H2-Zero](https://wavesha
 | **GPIO 3** | GPIO | Connected to **`SCL`** of the VL53L1X | I2C Clock line for the laser sensor |
 | **GPIO 5** | MTMS / GPIO | Connected to **`XSHUT`** of the VL53L1X | Shutdown control pin to turn off the laser in Deep Sleep |
 | **GPIO 1** | ADC1_CH0 / GPIO | Connected to the center of the divider | Analog pin used to measure battery voltage |
+| **GPIO 7** | LP GPIO | Connected to the center of the charger divider | Arduino firmware: high when the TP4056H USB input is powered (charger connected), also wakes the board from deep sleep |
 | **GPIO 8** | Onboard WS2812B | Status LED, no external wiring | Arduino firmware: blue while joining Zigbee, then green according to the `ledMode` setting (always on by default, blinking, or on for 5 s at boot only) |
 | **GPIO 9** | BOOT button | Onboard button, no external wiring | Arduino firmware: hold for 3 s to factory reset the Zigbee pairing |
 
@@ -88,6 +90,12 @@ All grounds must merge into a single logical point (**Common GND**). Follow this
    * **`OUT+`** pad on the TP4056H ──► Input of the first 100kΩ resistor (**R1**)
    * Output of R1 ──► Input of the second 100kΩ resistor (**R2**) **AND** **`GPIO 1`** pin on the ESP32-H2-Zero
    * Output of R2 ──► **Common GND** (`OUT-`)
+
+4. **Charger Detection Divider (Arduino firmware):**
+   * **`IN+`** pad on the TP4056H (USB 5V) ──► Input of a 100kΩ resistor (**R4**)
+   * Output of R4 ──► Input of a 150kΩ resistor (**R5**) **AND** **`GPIO 7`** pin on the ESP32-H2-Zero
+   * Output of R5 ──► **Common GND**
+   * With 5 V on `IN+` the pin sees about 3.0 V (logic high); without the charger R5 pulls it to 0 V, so no external pull-down is needed. The firmware disables the internal pull resistors: the internal pull-down (~45 kΩ) in parallel with R5 would drag the pin down to about 1.3 V
 
 ---
 
