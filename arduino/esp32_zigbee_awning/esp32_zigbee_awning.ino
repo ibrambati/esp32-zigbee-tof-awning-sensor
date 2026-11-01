@@ -48,7 +48,7 @@ static const uint8_t PIN_VBAT   = 1;   // ADC1_CH0, partitore 100k/100k + 100nF
 static const uint8_t PIN_SDA    = 2;   // VL53L1X SDA
 static const uint8_t PIN_SCL    = 3;   // VL53L1X SCL
 static const uint8_t PIN_XSHUT  = 5;   // VL53L1X shutdown (LOW = laser spento)
-static const uint8_t PIN_VIN    = 7;   // presenza caricatore: V_IN del TP4056 con partitore 100k/150k (alto = USB collegato)
+static const uint8_t PIN_VIN    = 10;   // presenza caricatore: V_IN del TP4056 con partitore 100k/150k (alto = USB collegato)
 static const uint8_t PIN_RGB    = 8;   // WS2812B integrato
 static const uint8_t PIN_BOOT   = 9;   // tasto BOOT: tenuto 3 s = factory reset Zigbee
 
@@ -230,7 +230,7 @@ uint8_t batteryPercent(float v) {
 }
 
 // ===================== CARICATORE =====================
-// Il TP4056 non espone il pin CHRG: la presenza dell'USB si legge da V_IN (partitore su GPIO7) e la
+// Il TP4056 non espone il pin CHRG: la presenza dell'USB si legge da V_IN (partitore su GPIO10) e la
 // fine carica si deduce dalla tensione (sopra VBAT_CHARGED per CHARGED_CONFIRM_MS). Stima, non il
 // segnale del chip: nella fase finale a 4,2 V "quasi carica" e "carica" non si distinguono.
 bool     chargerConnected = false;
@@ -467,7 +467,7 @@ void enterNightDeepSleep(uint32_t seconds) {
   ledOff();
   esp_sleep_enable_timer_wakeup((uint64_t)seconds * 1000000ULL);
 #if SOC_PM_SUPPORT_EXT1_WAKEUP
-  // Risveglio anche quando si collega il caricatore (GPIO7 e' un LP IO). ext1 e non gpio_wakeup:
+  // Risveglio anche quando si collega il caricatore (GPIO10 e' un LP IO). ext1 e non gpio_wakeup:
   // quest'ultimo con la configurazione di default attiva il pull-down interno e falserebbe il partitore.
   gpio_pullup_dis((gpio_num_t)PIN_VIN);
   gpio_pulldown_dis((gpio_num_t)PIN_VIN);
