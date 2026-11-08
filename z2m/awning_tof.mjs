@@ -17,6 +17,9 @@
  * (stessa cartella di configuration.yaml). Con Zigbee2MQTT >= 2.11 in nuove installazioni i
  * converter esterni sono disattivati: serve `enable_external_js: true` nella sezione `advanced`.
  * Poi riavviare Zigbee2MQTT, rimuovere il vecchio dispositivo e rifare l'accoppiamento.
+ *
+ * OTA: `ota: true` abilita gli aggiornamenti firmware. Le immagini vengono da un indice locale/URL
+ * (ota.zigbee_ota_override_index_location in configuration.yaml): istruzioni in arduino/README.md, sezione OTA.
  */
 import {Zcl} from 'zigbee-herdsman';
 import * as m from 'zigbee-herdsman-converters/lib/modernExtend';
@@ -57,6 +60,7 @@ export default {
     model: 'AwningToF',
     vendor: 'Ivan',
     description: 'Sensore ToF per estensione tenda da sole (ESP32-H2, a batteria)',
+    ota: true,   // il firmware ha il client OTA (cluster 0x0019): immagini in z2m/ota, vedi arduino/README.md
     extend: [
         awningCluster,
 
