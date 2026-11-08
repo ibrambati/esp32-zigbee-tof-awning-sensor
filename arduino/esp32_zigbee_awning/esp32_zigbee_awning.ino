@@ -82,7 +82,7 @@ static const uint16_t ATTR_BATT_PCT_REMAINING = 0x0021;  // ZCL Power Config: ba
 
 // ===================== OTA =====================
 // Versione del firmware in formato 0xMMmmpppp (Zigbee file_version, 32 bit). INCREMENTARLA a ogni release.
-static const uint32_t FW_VERSION           = 0x00010000;     // 0.1.0
+static const uint32_t FW_VERSION           = 0x00010001;     // 0.1.0
 static const uint32_t OTA_DOWNLOADED_VER   = 0xFFFFFFFF;     // "nessun file scaricato" (valore di default ZCL)
 static const uint16_t OTA_HW_VERSION       = 0x0001;
 // Manufacturer code e image type: DEVONO coincidere con l'indice OTA di Z2M (z2m/ota/index.json).
