@@ -27,6 +27,12 @@
  *                   0x0004 ReadIntervalMs (U16)      0x0005 LedMode (U8: 0 always-on, 1 blink, 2 boot-only)
  *                   0x0006 SleepEnabled (U8)         0x0007 SensorEnabled (U8: 1 laser acceso, 0 spento - debug)
  *  I report vanno all'indirizzo del coordinatore (0x0000, ep 1) senza dipendere dal binding.
+ *
+ * ---- OTA (aggiornamento firmware via Zigbee2MQTT) ----
+ *  Cluster OTA Upgrade (0x0019, client) sull'endpoint 10. Z2M lo serve da un indice locale (vedi z2m/ota/).
+ *  FW_VERSION va incrementata a ogni build da distribuire: Z2M aggiorna solo se la versione del file e' maggiore.
+ *  Durante un OTA il dispositivo resta sveglio (niente deep sleep, niente light sleep) e dopo il riavvio
+ *  tiene aperta una "finestra OTA" (OTA_WINDOW_MS) in cui il deep sleep notturno e' sospeso.
  */
 
 #ifndef ZIGBEE_MODE_ED
@@ -73,6 +79,20 @@ enum : uint8_t { STATUS_ACTIVE = 0, STATUS_DEEP_SLEEP = 1, STATUS_CHARGING = 2, 
 static const uint16_t COORD_SHORT_ADDR = 0x0000;   // il coordinatore e' sempre 0x0000
 static const uint8_t  COORD_ENDPOINT   = 1;
 static const uint16_t ATTR_BATT_PCT_REMAINING = 0x0021;  // ZCL Power Config: batteryPercentageRemaining
+
+// ===================== OTA =====================
+// Versione del firmware in formato 0xMMmmpppp (Zigbee file_version, 32 bit). INCREMENTARLA a ogni release.
+static const uint32_t FW_VERSION           = 0x00010000;     // 0.1.0
+static const uint32_t OTA_DOWNLOADED_VER   = 0xFFFFFFFF;     // "nessun file scaricato" (valore di default ZCL)
+static const uint16_t OTA_HW_VERSION       = 0x0001;
+// Manufacturer code e image type: DEVONO coincidere con l'indice OTA di Z2M (z2m/ota/index.json).
+// 0x1001 e' il codice usato dall'SDK Espressif per i test; il valore e' libero per un dispositivo DIY.
+static const uint16_t OTA_MANUFACTURER     = 0x1001;
+static const uint16_t OTA_IMAGE_TYPE       = 0x1011;
+static const uint8_t  OTA_MAX_DATA_SIZE    = 64;             // blocchi piccoli: piu' compatibili con Z2M (default 50-64 byte)
+// Dopo ogni boot (e quindi dopo ogni risveglio) il deep sleep notturno resta sospeso per questo tempo:
+// lascia al client OTA il tempo di interrogare Z2M e di scaricare l'immagine.
+static const uint32_t OTA_WINDOW_MS        = 10UL * 60 * 1000;
 
 // ===================== PARAMETRI =====================
 static const char*    TZ_STRING        = "CET-1CEST,M3.5.0,M10.5.0/3"; // Italia (il coordinatore invia UTC)
@@ -144,6 +164,7 @@ RTC_DATA_ATTR bool     timeValid         = false;
 
 volatile bool    timeResponseReceived = false;
 volatile bool    cfgDirty             = false;   // settato dal callback Zigbee, gestito nel loop
+volatile bool    otaRunning           = false;   // true mentre Z2M sta trasferendo un'immagine
 float            lastReportedCm = -100.0f;
 uint8_t          lastPercent    = 255;
 bool             isTimerWake    = false;
@@ -156,6 +177,7 @@ static const bool LED_RG_SWAPPED = true;
 void ledGreen() { if (LED_RG_SWAPPED) ledColor(40, 0, 0); else ledColor(0, 40, 0); }
 
 bool     zbJoined       = false;   // true quando il dispositivo e' connesso al controller
+uint32_t otaWindowUntilMs = 0;     // fino a questo istante (millis) il deep sleep notturno e' sospeso per l'OTA
 uint32_t ledBootUntilMs = 0;       // fine del verde in modalita' boot-only
 uint8_t  lastLedState   = 255;     // ultimo stato scritto sul LED (255 = da riapplicare)
 
@@ -172,6 +194,13 @@ void updateLed() {
     lastLedState = on;
     if (on) ledGreen(); else ledOff();
   }
+}
+
+// ===================== OTA CALLBACK =====================
+// Chiamata dal task Zigbee all'inizio e alla fine del trasferimento: solo flag, niente I/O pesante.
+void otaStateCallback(bool active) {
+  otaRunning = active;
+  Serial.println(active ? "OTA: trasferimento avviato" : "OTA: trasferimento terminato");
 }
 
 // ===================== NVS =====================
@@ -277,6 +306,10 @@ public:
     esp_zb_cluster_list_add_identify_cluster(_cluster_list, esp_zb_identify_cluster_create(NULL), ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
     addCustomCluster();
     addTimeClientCluster();
+    // Client OTA sullo stesso endpoint: va aggiunto dopo la creazione di _cluster_list e prima di Zigbee.begin()
+    if (!addOTAClient(FW_VERSION, OTA_DOWNLOADED_VER, OTA_HW_VERSION, OTA_MANUFACTURER, OTA_IMAGE_TYPE, OTA_MAX_DATA_SIZE)) {
+      Serial.println("OTA: aggiunta del cluster client fallita");
+    }
     _ep_config = {
       .endpoint = _endpoint,
       .app_profile_id = ESP_ZB_AF_HA_PROFILE_ID,
@@ -500,7 +533,9 @@ void setup() {
   zbAwning.buildClusters();                                  // dopo loadConfig(): attributi custom = valori NVS
   zbAwning.setManufacturerAndModel("Ivan", "AwningToF");
   zbAwning.setPowerSource(ZB_POWER_SOURCE_BATTERY, 100, 42); // aggiunge il cluster Power Config
+  zbAwning.onOTAStateChange(otaStateCallback);
   Zigbee.addEndpoint(&zbAwning);
+  Serial.printf("Firmware 0x%08lX\n", (unsigned long)FW_VERSION);
   // DIAGNOSI rejoin: 1 = radio sempre in ascolto (nessun polling), 0 = End Device a basso consumo
   #define DIAG_RX_ON_IDLE 1
   Zigbee.setRxOnWhenIdle(DIAG_RX_ON_IDLE ? true : false);
@@ -554,6 +589,10 @@ void setup() {
     }
   }
 
+  // --- OTA: interroga Z2M (prima richiesta entro ~1 minuto, poi ogni ora in automatico) ---
+  zbAwning.requestOTAUpdate();
+  otaWindowUntilMs = millis() + OTA_WINDOW_MS;
+
   // --- Sensore laser ---
   Wire.begin(PIN_SDA, PIN_SCL);
   if (cfg.sensorEnabled) {
@@ -581,7 +620,7 @@ void loop() {
   // Factory reset Zigbee (tasto BOOT 3 s)
   if (digitalRead(PIN_BOOT) == LOW) {
     if (!bootPressStart) bootPressStart = millis();
-    if (millis() - bootPressStart > 3000) {
+    if (millis() - bootPressStart > 3000 && !otaRunning) {   // mai un factory reset a OTA in corso
       Serial.println("Factory reset Zigbee");
       Zigbee.factoryReset();      // riavvia
     }
@@ -591,7 +630,9 @@ void loop() {
   if (updateCharger()) lastBatteryMs = 0;
 
   // --- Gestione fascia notturna (con il caricatore collegato resta sveglio: l'alimentazione c'e') ---
-  if (cfg.sleepEnabled && timeValid && !chargerConnected) {
+  // Con OTA in corso o nella finestra OTA post-boot il deep sleep e' sospeso.
+  bool otaBusy = otaRunning || (int32_t)(otaWindowUntilMs - millis()) > 0;
+  if (cfg.sleepEnabled && timeValid && !chargerConnected && !otaBusy) {
     time_t now = time(nullptr);
     tm lt; localtime_r(&now, &lt);
     if (inSleepWindow(lt)) {
@@ -661,6 +702,7 @@ void loop() {
 
   // In modalita' blink il loop deve girare piu' spesso per far lampeggiare il LED (consuma di piu')
   uint16_t waitMs = cfg.intervalMs;
+  if (otaRunning) waitMs = 100;     // durante l'OTA il loop non deve interferire: solo lavoro leggero
   if (cfg.ledMode == LED_BLINK && waitMs > 100) waitMs = 100;
   delay(waitMs);   // con sleep abilitato la CPU puo' andare in light sleep durante il delay
 }
