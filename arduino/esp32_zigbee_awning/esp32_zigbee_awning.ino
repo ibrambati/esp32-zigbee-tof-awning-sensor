@@ -100,6 +100,13 @@ static const uint32_t TIME_RESYNC_S    = 6UL * 3600;   // risincronizzo l'ora og
 static const uint32_t TIME_WAIT_MS     = 20000;        // attesa risposta Time all'avvio
 static const float    DELTA_CM         = 2.0f;         // soglia di variazione per il report
 static const uint8_t  ADC_SAMPLES      = 15;
+// Calibrazione consumi: il laser misura ogni LASER_PERIOD_MS (budget <= periodo). Il parametro Z2M "ReadIntervalMs"
+// regola invece solo il delay() del loop, non il periodo del laser.
+static const uint16_t LASER_BUDGET_MS  = 100;
+static const uint16_t LASER_PERIOD_MS  = 200;
+// Poll interval lungo dell'end device (radio spenta tra un poll e l'altro). Tenerlo sotto ~7 s:
+// oltre, il parent puo' scartare le scritture in coda (comandi da Z2M). Le notifiche in uscita non dipendono dal poll.
+static const uint32_t ZB_POLL_INTERVAL_MS = 4000;
 static const bool     INVERT_PERCENT   = false;        // true se in HA risulta invertita
 static const float    VBAT_EMPTY       = 3.2f;
 static const float    VBAT_FULL        = 4.2f;
@@ -137,8 +144,8 @@ bool initSensor() {
   delay(10);
   if (distanceSensor.begin() != 0) return false;
   distanceSensor.setDistanceModeLong();
-  distanceSensor.setTimingBudgetInMs(100);
-  distanceSensor.setIntermeasurementPeriod(100);   // libreria SparkFun: nome corretto del metodo
+  distanceSensor.setTimingBudgetInMs(LASER_BUDGET_MS);
+  distanceSensor.setIntermeasurementPeriod(LASER_PERIOD_MS);   // libreria SparkFun: nome corretto del metodo
   distanceSensor.startRanging();
   return true;
 }
@@ -537,7 +544,7 @@ void setup() {
   Zigbee.addEndpoint(&zbAwning);
   Serial.printf("Firmware 0x%08lX\n", (unsigned long)FW_VERSION);
   // DIAGNOSI rejoin: 1 = radio sempre in ascolto (nessun polling), 0 = End Device a basso consumo
-  #define DIAG_RX_ON_IDLE 1
+  #define DIAG_RX_ON_IDLE 0
   Zigbee.setRxOnWhenIdle(DIAG_RX_ON_IDLE ? true : false);
 
   if (!isTimerWake) ledColor(0, 0, 40);   // blu fisso mentre lo stack parte (begin() puo' bloccare fino a 30 s)
@@ -576,6 +583,13 @@ void setup() {
   }
   // Connesso al controller: da qui il LED segue ledMode (verde). In boot-only niente LED dopo un risveglio notturno.
   zbJoined = true;
+  if (!DIAG_RX_ON_IDLE) {
+    // Va impostato DOPO il join (durante il join lo stack usa il valore di default).
+    esp_zb_lock_acquire(portMAX_DELAY);
+    esp_zb_zdo_pim_set_long_poll_interval(ZB_POLL_INTERVAL_MS);
+    esp_zb_lock_release();
+    Serial.printf("Zigbee: poll interval lungo %lu ms\n", (unsigned long)ZB_POLL_INTERVAL_MS);
+  }
   ledBootUntilMs = isTimerWake ? 0 : millis() + LED_BOOT_MS;
   updateLed();
 
