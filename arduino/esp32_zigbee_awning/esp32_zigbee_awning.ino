@@ -107,10 +107,11 @@ static const uint16_t LASER_PERIOD_MS  = 200;
 // Poll interval lungo dell'end device (radio spenta tra un poll e l'altro). Tenerlo sotto ~7 s:
 // oltre, il parent puo' scartare le scritture in coda (comandi da Z2M). Le notifiche in uscita non dipendono dal poll.
 static const uint32_t ZB_POLL_INTERVAL_MS = 4000;
-// Accoppiamento: finche' il flag NVS "paired" non e' impostato (primo avvio o dopo un factory reset) il dispositivo
-// resta con la radio SEMPRE accesa, cosi' join e interview di Z2M non vanno in timeout. Passato PAIRING_SETTLE_MS
-// dal join il flag viene salvato e il dispositivo si riavvia in modalita' sleepy (rientra in rete dai dati salvati).
+// Il boot parte SEMPRE con la radio accesa (rejoin affidabile). A rete stabile enterSleepy() passa a End Device
+// sleepy a runtime: PAIRING_SETTLE_MS dopo il primo accoppiamento (lascia finire l'interview di Z2M),
+// SLEEPY_DELAY_MS dopo il join nei boot normali.
 static const uint32_t PAIRING_SETTLE_MS   = 3UL * 60 * 1000;
+static const uint32_t SLEEPY_DELAY_MS     = 20UL * 1000;
 static const bool     INVERT_PERCENT   = false;        // true se in HA risulta invertita
 static const float    VBAT_EMPTY       = 3.2f;
 static const float    VBAT_FULL        = 4.2f;
@@ -181,14 +182,15 @@ uint8_t          lastPercent    = 255;
 bool             isTimerWake    = false;
 
 // ===================== LED =====================
-void ledColor(uint8_t r, uint8_t g, uint8_t b) { neopixelWrite(PIN_RGB, r, g, b); }
-void ledOff() { neopixelWrite(PIN_RGB, 0, 0, 0); }
+void ledColor(uint8_t r, uint8_t g, uint8_t b) { rgbLedWrite(PIN_RGB, r, g, b); }
+void ledOff() { rgbLedWrite(PIN_RGB, 0, 0, 0); }
 // Su questa scheda il LED mostrava ROSSO scrivendo (0,40,0): canali R/G invertiti. Se il verde esce rosso, lascia true; se esce verde, metti false.
 static const bool LED_RG_SWAPPED = true;
 void ledGreen() { if (LED_RG_SWAPPED) ledColor(40, 0, 0); else ledColor(0, 40, 0); }
 
 bool     zbJoined       = false;   // true quando il dispositivo e' connesso al controller
-bool     pairingMode    = false;   // true finche' l'accoppiamento non e' completato (radio sempre accesa)
+bool     sleepyActive   = false;   // true dopo il passaggio a End Device sleepy (a runtime)
+bool     pairingMode    = false;   // true finche' il primo accoppiamento non e' completato (flag NVS "paired")
 uint32_t joinedAtMs     = 0;       // istante (millis) del join in questo boot
 uint32_t otaWindowUntilMs = 0;     // fino a questo istante (millis) il deep sleep notturno e' sospeso per l'OTA
 uint32_t ledBootUntilMs = 0;       // fine del verde in modalita' boot-only
@@ -243,6 +245,19 @@ void setPaired(bool v) {
   prefs.begin("awning", false);
   prefs.putUChar("paired", v ? 1 : 0);
   prefs.end();
+}
+
+// Passa a End Device sleepy senza riavviare: rx_on_when_idle off, poll lungo, light sleep dello stack.
+void enterSleepy() {
+  Serial.println("Passo a modalita' sleepy (basso consumo)");
+  if (pairingMode) { setPaired(true); pairingMode = false; }
+  esp_zb_lock_acquire(portMAX_DELAY);
+  esp_zb_set_rx_on_when_idle(false);
+  esp_zb_set_default_long_poll_interval(ZB_POLL_INTERVAL_MS);
+  esp_zb_lock_release();
+  esp_zb_sleep_enable(true);
+  sleepyActive = true;
+  Serial.printf("rx_on_when_idle = %d\n", (int)esp_zb_get_rx_on_when_idle());
 }
 
 void saveConfig() {
@@ -563,15 +578,12 @@ void setup() {
   zbAwning.onOTAStateChange(otaStateCallback);
   Zigbee.addEndpoint(&zbAwning);
   Serial.printf("Firmware 0x%08lX\n", (unsigned long)FW_VERSION);
-  // DIAG_RX_ON_IDLE: 1 = radio sempre in ascolto in ogni caso (override di diagnosi), 0 = automatico:
-  // radio accesa solo durante l'accoppiamento, poi End Device sleepy a basso consumo.
+  // Il boot parte SEMPRE a radio accesa (rejoin affidabile). Il passaggio a End Device sleepy avviene
+  // a runtime, a rete stabile (vedi enterSleepy()). DIAG_RX_ON_IDLE 1 = resta sempre acceso (diagnosi).
   #define DIAG_RX_ON_IDLE 0
   pairingMode = !loadPaired();
-  const bool rxOn = DIAG_RX_ON_IDLE || pairingMode;
-  Serial.printf("Modalita': %s\n", rxOn ? (pairingMode ? "accoppiamento (radio sempre accesa)" : "radio sempre accesa (diag)") : "sleepy (basso consumo)");
-  Zigbee.setRxOnWhenIdle(rxOn);
-  // Poll interval lungo di default dello stack: va impostato PRIMA di Zigbee.begin().
-  if (!rxOn) esp_zb_set_default_long_poll_interval(ZB_POLL_INTERVAL_MS);
+  Serial.printf("Modalita': %s (boot a radio accesa)\n", pairingMode ? "accoppiamento" : "normale");
+  Zigbee.setRxOnWhenIdle(true);
 
   if (!isTimerWake) ledColor(0, 0, 40);   // blu fisso mentre lo stack parte (begin() puo' bloccare fino a 30 s)
   if (!Zigbee.begin(ZIGBEE_END_DEVICE)) {
@@ -584,7 +596,6 @@ void setup() {
     // lo stack continua a cercare in background. Si aspetta nel ciclo qui sotto con il LED blu lampeggiante.
     Serial.println("Zigbee: rete non ancora trovata, continuo a cercare");
   }
-  if (!rxOn) esp_zb_sleep_enable(true);   // light sleep dello stack quando idle (solo in modalita' sleepy)
 
   // --- Attesa join (LED blu lampeggiante solo se NON e' un risveglio notturno) ---
   bool led = !isTimerWake;
@@ -611,7 +622,7 @@ void setup() {
   // Connesso al controller: da qui il LED segue ledMode (verde). In boot-only niente LED dopo un risveglio notturno.
   zbJoined = true;
   joinedAtMs = millis();
-  Serial.println(pairingMode ? "Join completato: resto sveglio per l'interview, poi riavvio in modalita' sleepy"
+  Serial.println(pairingMode ? "Join completato: resto sveglio per l'interview, poi passo a sleepy"
                              : "Join completato");
   ledBootUntilMs = isTimerWake ? 0 : millis() + LED_BOOT_MS;
   updateLed();
@@ -651,13 +662,11 @@ uint32_t bootPressStart = 0;
 uint8_t  lastStatus = 255;
 
 void loop() {
-  // Fine accoppiamento: salva il flag e riavvia in modalita' sleepy (mai durante un OTA).
-  if (pairingMode && !otaRunning && millis() - joinedAtMs > PAIRING_SETTLE_MS) {
-    Serial.println("Accoppiamento completato: riavvio in modalita' sleepy");
-    Serial.flush();
-    setPaired(true);
-    delay(200);
-    ESP.restart();
+  // Passaggio a sleepy a rete stabile (mai durante un OTA): dopo il primo accoppiamento attende che finisca
+  // l'interview di Z2M, nei boot normali solo SLEEPY_DELAY_MS.
+  if (!DIAG_RX_ON_IDLE && !sleepyActive && zbJoined && !otaRunning &&
+      millis() - joinedAtMs > (pairingMode ? PAIRING_SETTLE_MS : SLEEPY_DELAY_MS)) {
+    enterSleepy();
   }
   if (cfgDirty) { cfgDirty = false; applyConfigChange(); }
   updateLed();
