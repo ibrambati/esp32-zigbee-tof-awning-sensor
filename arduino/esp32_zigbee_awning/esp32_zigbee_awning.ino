@@ -546,6 +546,8 @@ void setup() {
   // DIAGNOSI rejoin: 1 = radio sempre in ascolto (nessun polling), 0 = End Device a basso consumo
   #define DIAG_RX_ON_IDLE 0
   Zigbee.setRxOnWhenIdle(DIAG_RX_ON_IDLE ? true : false);
+  // Poll interval lungo di default dello stack: va impostato PRIMA di Zigbee.begin().
+  if (!DIAG_RX_ON_IDLE) esp_zb_set_default_long_poll_interval(ZB_POLL_INTERVAL_MS);
 
   if (!isTimerWake) ledColor(0, 0, 40);   // blu fisso mentre lo stack parte (begin() puo' bloccare fino a 30 s)
   if (!Zigbee.begin(ZIGBEE_END_DEVICE)) {
@@ -583,13 +585,6 @@ void setup() {
   }
   // Connesso al controller: da qui il LED segue ledMode (verde). In boot-only niente LED dopo un risveglio notturno.
   zbJoined = true;
-  if (!DIAG_RX_ON_IDLE) {
-    // Va impostato DOPO il join (durante il join lo stack usa il valore di default).
-    esp_zb_lock_acquire(portMAX_DELAY);
-    esp_zb_zdo_pim_set_long_poll_interval(ZB_POLL_INTERVAL_MS);
-    esp_zb_lock_release();
-    Serial.printf("Zigbee: poll interval lungo %lu ms\n", (unsigned long)ZB_POLL_INTERVAL_MS);
-  }
   ledBootUntilMs = isTimerWake ? 0 : millis() + LED_BOOT_MS;
   updateLed();
 
