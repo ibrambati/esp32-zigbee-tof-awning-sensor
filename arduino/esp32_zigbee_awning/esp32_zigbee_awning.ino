@@ -107,6 +107,10 @@ static const uint16_t LASER_PERIOD_MS  = 200;
 // Poll interval lungo dell'end device (radio spenta tra un poll e l'altro). Tenerlo sotto ~7 s:
 // oltre, il parent puo' scartare le scritture in coda (comandi da Z2M). Le notifiche in uscita non dipendono dal poll.
 static const uint32_t ZB_POLL_INTERVAL_MS = 4000;
+// Accoppiamento: finche' il flag NVS "paired" non e' impostato (primo avvio o dopo un factory reset) il dispositivo
+// resta con la radio SEMPRE accesa, cosi' join e interview di Z2M non vanno in timeout. Passato PAIRING_SETTLE_MS
+// dal join il flag viene salvato e il dispositivo si riavvia in modalita' sleepy (rientra in rete dai dati salvati).
+static const uint32_t PAIRING_SETTLE_MS   = 3UL * 60 * 1000;
 static const bool     INVERT_PERCENT   = false;        // true se in HA risulta invertita
 static const float    VBAT_EMPTY       = 3.2f;
 static const float    VBAT_FULL        = 4.2f;
@@ -184,6 +188,8 @@ static const bool LED_RG_SWAPPED = true;
 void ledGreen() { if (LED_RG_SWAPPED) ledColor(40, 0, 0); else ledColor(0, 40, 0); }
 
 bool     zbJoined       = false;   // true quando il dispositivo e' connesso al controller
+bool     pairingMode    = false;   // true finche' l'accoppiamento non e' completato (radio sempre accesa)
+uint32_t joinedAtMs     = 0;       // istante (millis) del join in questo boot
 uint32_t otaWindowUntilMs = 0;     // fino a questo istante (millis) il deep sleep notturno e' sospeso per l'OTA
 uint32_t ledBootUntilMs = 0;       // fine del verde in modalita' boot-only
 uint8_t  lastLedState   = 255;     // ultimo stato scritto sul LED (255 = da riapplicare)
@@ -222,6 +228,20 @@ void loadConfig() {
   if (cfg.ledMode > LED_BOOT_ONLY) cfg.ledMode = LED_ALWAYS_ON;
   cfg.sleepEnabled = prefs.getUChar("slEn", 0) ? 1 : 0;
   cfg.sensorEnabled = prefs.getUChar("sensEn", 1) ? 1 : 0;
+  prefs.end();
+}
+
+// Flag "accoppiamento completato" (NVS). Va azzerato prima di ogni factory reset Zigbee.
+bool loadPaired() {
+  prefs.begin("awning", true);
+  bool p = prefs.getUChar("paired", 0) != 0;
+  prefs.end();
+  return p;
+}
+
+void setPaired(bool v) {
+  prefs.begin("awning", false);
+  prefs.putUChar("paired", v ? 1 : 0);
   prefs.end();
 }
 
@@ -543,11 +563,15 @@ void setup() {
   zbAwning.onOTAStateChange(otaStateCallback);
   Zigbee.addEndpoint(&zbAwning);
   Serial.printf("Firmware 0x%08lX\n", (unsigned long)FW_VERSION);
-  // DIAGNOSI rejoin: 1 = radio sempre in ascolto (nessun polling), 0 = End Device a basso consumo
+  // DIAG_RX_ON_IDLE: 1 = radio sempre in ascolto in ogni caso (override di diagnosi), 0 = automatico:
+  // radio accesa solo durante l'accoppiamento, poi End Device sleepy a basso consumo.
   #define DIAG_RX_ON_IDLE 0
-  Zigbee.setRxOnWhenIdle(DIAG_RX_ON_IDLE ? true : false);
+  pairingMode = !loadPaired();
+  const bool rxOn = DIAG_RX_ON_IDLE || pairingMode;
+  Serial.printf("Modalita': %s\n", rxOn ? (pairingMode ? "accoppiamento (radio sempre accesa)" : "radio sempre accesa (diag)") : "sleepy (basso consumo)");
+  Zigbee.setRxOnWhenIdle(rxOn);
   // Poll interval lungo di default dello stack: va impostato PRIMA di Zigbee.begin().
-  if (!DIAG_RX_ON_IDLE) esp_zb_set_default_long_poll_interval(ZB_POLL_INTERVAL_MS);
+  if (!rxOn) esp_zb_set_default_long_poll_interval(ZB_POLL_INTERVAL_MS);
 
   if (!isTimerWake) ledColor(0, 0, 40);   // blu fisso mentre lo stack parte (begin() puo' bloccare fino a 30 s)
   if (!Zigbee.begin(ZIGBEE_END_DEVICE)) {
@@ -560,7 +584,7 @@ void setup() {
     // lo stack continua a cercare in background. Si aspetta nel ciclo qui sotto con il LED blu lampeggiante.
     Serial.println("Zigbee: rete non ancora trovata, continuo a cercare");
   }
-  if (!DIAG_RX_ON_IDLE) esp_zb_sleep_enable(true);   // light sleep dello stack quando idle
+  if (!rxOn) esp_zb_sleep_enable(true);   // light sleep dello stack quando idle (solo in modalita' sleepy)
 
   // --- Attesa join (LED blu lampeggiante solo se NON e' un risveglio notturno) ---
   bool led = !isTimerWake;
@@ -578,6 +602,7 @@ void setup() {
       if (!joinBootStart) joinBootStart = millis();
       if (millis() - joinBootStart > 3000) {
         Serial.println("Factory reset Zigbee (attesa join)");
+        setPaired(false);           // al prossimo avvio si riparte in modalita' accoppiamento
         Zigbee.factoryReset();      // riavvia
       }
     } else joinBootStart = 0;
@@ -585,6 +610,9 @@ void setup() {
   }
   // Connesso al controller: da qui il LED segue ledMode (verde). In boot-only niente LED dopo un risveglio notturno.
   zbJoined = true;
+  joinedAtMs = millis();
+  Serial.println(pairingMode ? "Join completato: resto sveglio per l'interview, poi riavvio in modalita' sleepy"
+                             : "Join completato");
   ledBootUntilMs = isTimerWake ? 0 : millis() + LED_BOOT_MS;
   updateLed();
 
@@ -623,6 +651,14 @@ uint32_t bootPressStart = 0;
 uint8_t  lastStatus = 255;
 
 void loop() {
+  // Fine accoppiamento: salva il flag e riavvia in modalita' sleepy (mai durante un OTA).
+  if (pairingMode && !otaRunning && millis() - joinedAtMs > PAIRING_SETTLE_MS) {
+    Serial.println("Accoppiamento completato: riavvio in modalita' sleepy");
+    Serial.flush();
+    setPaired(true);
+    delay(200);
+    ESP.restart();
+  }
   if (cfgDirty) { cfgDirty = false; applyConfigChange(); }
   updateLed();
 
@@ -631,6 +667,7 @@ void loop() {
     if (!bootPressStart) bootPressStart = millis();
     if (millis() - bootPressStart > 3000 && !otaRunning) {   // mai un factory reset a OTA in corso
       Serial.println("Factory reset Zigbee");
+      setPaired(false);           // al prossimo avvio si riparte in modalita' accoppiamento
       Zigbee.factoryReset();      // riavvia
     }
   } else bootPressStart = 0;
@@ -641,7 +678,7 @@ void loop() {
   // --- Gestione fascia notturna (con il caricatore collegato resta sveglio: l'alimentazione c'e') ---
   // Con OTA in corso o nella finestra OTA post-boot il deep sleep e' sospeso.
   bool otaBusy = otaRunning || (int32_t)(otaWindowUntilMs - millis()) > 0;
-  if (cfg.sleepEnabled && timeValid && !chargerConnected && !otaBusy) {
+  if (cfg.sleepEnabled && timeValid && !chargerConnected && !otaBusy && !pairingMode) {
     time_t now = time(nullptr);
     tm lt; localtime_r(&now, &lt);
     if (inSleepWindow(lt)) {
