@@ -1,0 +1,12 @@
+[
+  {
+    "fileName": "1001-1011-00010001-awning_tof.zigbee",
+    "fileVersion": 65537,
+    "fileSize": 745262,
+    "url": "https://raw.githubusercontent.com/ibrambati/esp32-zigbee-tof-awning-sensor/feat/zigbee-ota/z2m/ota/1001-1011-00010001-awning_tof.zigbee",
+    "imageType": 4113,
+    "manufacturerCode": 4097,
+    "sha512": "87ce95e4e48f6f6dc843901ddc2b179453564b72f29912faeb49f818b2309a5e58558d55392e486eaa2ea299f83c4420871e54cc5b136f37fcdf7428187ca9ba",
+    "modelId": "AwningToF"
+  }
+]

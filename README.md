@@ -23,10 +23,10 @@ Repository layout:
 ```
 .
 ├── README.md     # this file: hardware, BOM, wiring
-├── docs/         # photos, schematics, datasheets
+├── docs/         # photos, datasheets and OTA.md (how to build and install OTA updates)
 ├── esphome/      # ESPHome firmware + README
 ├── arduino/      # Arduino firmware, build setup + README
-└── z2m/          # Zigbee2MQTT external converter for the Arduino firmware
+└── z2m/          # Zigbee2MQTT converter and OTA images/index for the Arduino firmware
 ```
 
 ## 📦 Bill of Materials (BOM)
@@ -105,5 +105,6 @@ Once the hardware is assembled, flash one of the two firmwares:
 
 * **[ESPHome firmware](esphome/README.md)**: YAML configuration, flashing via the ESPHome dashboard / web tool, pairing with Zigbee2MQTT or ZHA. Settings are fixed at compile time.
 * **[Arduino firmware](arduino/README.md)**: `arduino-cli` project with build and flash instructions, parameters writable over Zigbee and the Zigbee2MQTT converter setup. Still work in progress.
+  * **[Over-the-air updates](docs/OTA.md)**: once installed, the Arduino firmware can be updated through Zigbee2MQTT, with no USB cable. Step-by-step guide: version, build, image, publish, install.
 
 In both cases the ESP32-H2-Zero is flashed over its native **USB Type-C port** the first time, since it speaks Zigbee and not Wi-Fi.
