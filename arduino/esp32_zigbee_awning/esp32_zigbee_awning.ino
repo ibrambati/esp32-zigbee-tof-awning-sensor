@@ -100,10 +100,13 @@ static const uint32_t TIME_RESYNC_S    = 6UL * 3600;   // risincronizzo l'ora og
 static const uint32_t TIME_WAIT_MS     = 20000;        // attesa risposta Time all'avvio
 static const float    DELTA_CM         = 2.0f;         // soglia di variazione per il report
 static const uint8_t  ADC_SAMPLES      = 15;
-// Calibrazione consumi: il laser misura ogni LASER_PERIOD_MS (budget <= periodo). Il parametro Z2M "ReadIntervalMs"
-// regola invece solo il delay() del loop, non il periodo del laser.
 static const uint16_t LASER_BUDGET_MS  = 100;
-static const uint16_t LASER_PERIOD_MS  = 200;
+// Ciclo del laser = ReadIntervalMs impostato da FE (min 100 ms): LASER_BUDGET_MS di misura + (intervallo - budget) di riposo,
+// gestito dal sensore stesso (inter-measurement period). Es.: 500 ms -> 100 ms misura + 400 ms riposo.
+// Batteria: si legge a laser fermo, dopo BATTERY_PRE_SETTLE_MS, con mediana di ADC_SAMPLES campioni.
+// La prima lettura dopo il boot avviene BATTERY_FIRST_DELAY_MS dopo il join (evita i valori bassi del boot).
+static const uint32_t BATTERY_PRE_SETTLE_MS  = 150;
+static const uint32_t BATTERY_FIRST_DELAY_MS = 60000UL;
 // Poll interval lungo dell'end device (radio spenta tra un poll e l'altro). Tenerlo sotto ~7 s:
 // oltre, il parent puo' scartare le scritture in coda (comandi da Z2M). Le notifiche in uscita non dipendono dal poll.
 static const uint32_t ZB_POLL_INTERVAL_MS = 4000;
@@ -141,6 +144,10 @@ SFEVL53L1X distanceSensor;
 bool     sensorOk = false;        // true se il VL53L1X e' stato inizializzato correttamente
 uint32_t lastSensorTryMs = 0;     // ultimo tentativo di inizializzazione
 
+// Periodo del ciclo laser: ReadIntervalMs, mai sotto il budget di misura.
+uint16_t laserPeriodMs() { return cfg.intervalMs < LASER_BUDGET_MS ? LASER_BUDGET_MS : cfg.intervalMs; }
+uint16_t laserPeriodApplied = 0;   // periodo gia' configurato nel sensore
+
 // Inizializza il laser (XSHUT alto + begin + parametri + startRanging). Ritorna true se risponde.
 bool initSensor() {
   digitalWrite(PIN_XSHUT, LOW);
@@ -150,9 +157,20 @@ bool initSensor() {
   if (distanceSensor.begin() != 0) return false;
   distanceSensor.setDistanceModeLong();
   distanceSensor.setTimingBudgetInMs(LASER_BUDGET_MS);
-  distanceSensor.setIntermeasurementPeriod(LASER_PERIOD_MS);   // libreria SparkFun: nome corretto del metodo
+  distanceSensor.setIntermeasurementPeriod(laserPeriodMs());   // libreria SparkFun: nome corretto del metodo
+  laserPeriodApplied = laserPeriodMs();
   distanceSensor.startRanging();
   return true;
+}
+
+// Cambio intervallo da FE a sensore gia' acceso: ferma, riconfigura il periodo, riparte.
+void applyLaserTiming() {
+  if (!sensorOk || laserPeriodApplied == laserPeriodMs()) return;
+  laserPeriodApplied = laserPeriodMs();
+  distanceSensor.stopRanging();
+  distanceSensor.setTimingBudgetInMs(LASER_BUDGET_MS);
+  distanceSensor.setIntermeasurementPeriod(laserPeriodMs());
+  distanceSensor.startRanging();
 }
 
 // Switch di debug: accende o spegne fisicamente il laser (XSHUT). Va chiamata solo dal loop()/setup(),
@@ -276,13 +294,28 @@ void saveConfig() {
 // ===================== BATTERIA =====================
 float readBatteryVolts() {
   analogSetPinAttenuation(PIN_VBAT, ADC_11db);   // ~12 dB nel core 3.x (ADC_11db e' il valore massimo)
-  uint32_t sum = 0;
+  uint32_t v[ADC_SAMPLES];
   for (uint8_t i = 0; i < ADC_SAMPLES; i++) {
-    sum += analogReadMilliVolts(PIN_VBAT);       // usa la calibrazione eFuse
+    v[i] = analogReadMilliVolts(PIN_VBAT);       // usa la calibrazione eFuse
     delay(1);
   }
-  float mv = sum / (float)ADC_SAMPLES;
+  for (uint8_t i = 1; i < ADC_SAMPLES; i++) {    // ordinamento a inserimento: serve solo la mediana
+    uint32_t x = v[i]; int j = i - 1;
+    while (j >= 0 && v[j] > x) { v[j + 1] = v[j]; j--; }
+    v[j + 1] = x;
+  }
+  float mv = v[ADC_SAMPLES / 2];                 // mediana: scarta i picchi (es. trasmissione radio)
   return (mv * 2.0f) / 1000.0f * VBAT_CAL;       // partitore 1:2
+}
+
+// Lettura a laser fermo: ferma il ranging, attende che il partitore si stabilizzi, legge, riparte.
+float readBatteryQuiet() {
+  bool wasRanging = sensorOk;
+  if (wasRanging) distanceSensor.stopRanging();
+  delay(BATTERY_PRE_SETTLE_MS);
+  float v = readBatteryVolts();
+  if (wasRanging) distanceSensor.startRanging();
+  return v;
 }
 
 uint8_t batteryPercent(float v) {
@@ -500,6 +533,7 @@ void applyConfigChange() {
   if (cfg.sleepEnabled > 1) cfg.sleepEnabled = 1;
   if (cfg.sensorEnabled > 1) cfg.sensorEnabled = 1;
   applySensorEnabled();
+  applyLaserTiming();          // il ReadIntervalMs e' anche il periodo del ciclo laser
   lastLedState = 255;          // riapplica subito la nuova modalita' del LED
   if (cfg.ledMode == LED_BOOT_ONLY) ledBootUntilMs = millis() + LED_BOOT_MS;   // mostra l'effetto per 5 s
   if (cfg.maxCm <= cfg.zeroCm) cfg.maxCm = cfg.zeroCm + 1;   // evita divisione per zero / span negativo
@@ -652,7 +686,7 @@ void setup() {
     Serial.println("Sensore spento da switch (XSHUT LOW)");   // XSHUT e' gia' LOW da prima di Zigbee.begin()
   }
 
-  // la prima misura batteria e il primo stato li invia il loop (lastBatteryMs == 0, lastStatus == 255)
+  // la prima misura batteria (BATTERY_FIRST_DELAY_MS dopo il join) e il primo stato li invia il loop
   zbAwning.publishConfig();   // allinea l'interfaccia ai valori salvati in NVS
 }
 
@@ -703,7 +737,9 @@ void loop() {
   }
 
   // --- Lettura laser ---
+  bool gotReading = false;
   if (sensorOk && distanceSensor.checkForDataReady()) {
+    gotReading = true;
     float cm = distanceSensor.getDistance() / 10.0f;   // mm -> cm
     distanceSensor.clearInterrupt();
 
@@ -724,11 +760,13 @@ void loop() {
     }
   }
 
-  // --- Batteria: ogni 10 minuti, ogni minuto con il caricatore collegato ---
+  // --- Batteria: ogni 10 minuti, ogni minuto con il caricatore collegato. Prima lettura 60 s dopo il join. ---
   uint32_t batteryItv = chargerConnected ? BATTERY_INTERVAL_CHARGING_MS : BATTERY_INTERVAL_MS;
-  if (millis() - lastBatteryMs > batteryItv || lastBatteryMs == 0) {
+  bool batteryDue = lastBatteryMs == 0 ? (millis() - joinedAtMs > BATTERY_FIRST_DELAY_MS)
+                                       : (millis() - lastBatteryMs > batteryItv);
+  if (batteryDue) {
     lastBatteryMs = millis();
-    float v = readBatteryVolts();
+    float v = readBatteryQuiet();
     if (chargerConnected) {
       if (v < VBAT_CHARGED) chargedSinceMs = 0;
       else if (!chargedSinceMs) chargedSinceMs = millis() | 1;
@@ -756,7 +794,8 @@ void loop() {
   }
 
   // In modalita' blink il loop deve girare piu' spesso per far lampeggiare il LED (consuma di piu')
-  uint16_t waitMs = cfg.intervalMs;
+  // Il sensore misura da solo ogni laserPeriodMs(): dopo una lettura si dorme fin quasi alla prossima, poi si fa polling stretto.
+  uint16_t waitMs = (sensorOk && cfg.intervalMs > 40) ? (gotReading ? cfg.intervalMs - 30 : 10) : cfg.intervalMs;
   if (otaRunning) waitMs = 100;     // durante l'OTA il loop non deve interferire: solo lavoro leggero
   if (cfg.ledMode == LED_BLINK && waitMs > 100) waitMs = 100;
   delay(waitMs);   // con sleep abilitato la CPU puo' andare in light sleep durante il delay
