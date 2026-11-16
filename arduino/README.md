@@ -44,8 +44,9 @@ The [ESPHome firmware](../esphome/README.md) cannot expose parameters that are w
 
   While the charger is connected the battery percentage is not updated (the terminal voltage is inflated by the charge current), only the voltage is; at charge complete it is set to 100 %. After unplugging, the percentage resumes after `BATTERY_SETTLE_MS` (2 minutes). With the charger connected the board never enters the night deep sleep, and plugging the charger in during the night wakes it up (ext1 wake-up on GPIO 10)
 - **Status LED**: blue while the Zigbee stack starts and joins, then green according to LED mode (always on, blinking, or only for 5 s after boot). The red and green channels are swapped on this board: `LED_RG_SWAPPED` in the sketch
-- **Join**: if no network is found after 10 minutes the board restarts and tries again
-- **Factory reset**: hold the BOOT button for 3 s, also while waiting for the join
+- **Boot flow**: battery check with the radio off (below `VBAT_MIN_BOOT` the board sleeps 30 minutes), one `Zigbee.begin()`, join (2 minutes, 10 at the first pairing) and confirmation from the coordinator's Time response (30 s). If the join or the confirmation fails the board sleeps 30 minutes and retries. See [`../docs/BOOT_FLOW.md`](../docs/BOOT_FLOW.md)
+- **Reset log** (custom cluster, read-only): `0x0014` reset reason of this boot, `0x0015` planned cause of the previous sleep/restart, `0x0016` total brown-out/panic/watchdog resets, `0x0017` reason of the last such reset. After 3 consecutive ones the board sleeps 30 minutes
+- **External button** (GPIO 12): click = restart, hold 10 s (LED turns white) and release = factory reset of the Zigbee pairing, also while waiting for the join. The onboard BOOT button is no longer read by the firmware
 
 ## Pinout used by the firmware
 
@@ -56,8 +57,9 @@ The [ESPHome firmware](../esphome/README.md) cannot expose parameters that are w
 | 3 | VL53L1X SCL |
 | 5 | VL53L1X XSHUT (laser off during deep sleep) |
 | 8 | Onboard WS2812B status LED |
-| 9 | BOOT button (factory reset when held 3 s) |
+| 9 | BOOT button: download mode only, not read by the firmware |
 | 10 | Charger detection (TP4056H `IN+` through a 100k/150k divider, high = USB connected, deep sleep wake-up) |
+| 12 | External button to 3V3, 100k pull-down to GND (active high, deep sleep wake-up) |
 
 Wiring details are in the [main README](../README.md#-wiring-list).
 

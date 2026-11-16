@@ -7,6 +7,8 @@
  * Il cluster custom 0xFC00 deve coincidere con il firmware (ID e tipi degli attributi):
  *   sola lettura  0x0010 distanza (mm, U16)   0x0011 apertura (%, U8)   0x0012 tensione batteria (mV, U16)
  *                 0x0013 stato (U8: 0 attivo, 1 deep sleep, 2 in carica, 3 carica completa)
+ *                 0x0014 motivo dell'ultimo reset (U8, esp_reset_reason_t)   0x0015 causa pianificata (U8)
+ *                 0x0016 reset sporchi totali (U16)   0x0017 motivo dell'ultimo reset sporco (U8, esp_reset_reason_t)
  *   scrittura     0x0000 zero tenda chiusa (cm)   0x0001 lunghezza massima (cm)
  *                 0x0002 ora inizio deep sleep    0x0003 ora fine deep sleep   0x0004 intervallo lettura (ms)
  *                 0x0005 modalita LED (0 always-on, 1 blink, 2 boot-only)
@@ -29,6 +31,12 @@ const T = Zcl.DataType;
 
 const attr = (name, ID, type, write = false) => ({name, ID, type, write});
 
+// esp_reset_reason_t di ESP-IDF 5.x (valori del firmware per resetReason e lastDirtyReason)
+const RESET_REASONS = {
+    unknown: 0, poweron: 1, ext: 2, sw: 3, panic: 4, int_wdt: 5, task_wdt: 6, wdt: 7,
+    deepsleep: 8, brownout: 9, sdio: 10, usb: 11, jtag: 12, efuse: 13, pwr_glitch: 14, cpu_lockup: 15,
+};
+
 // Decimali delle misure. Zigbee2MQTT non inoltra la `precision` delle exposes a Home Assistant e
 // HA applica i propri default per device_class (0 decimali per V e cm), quindi la stessa
 // precisione viene passata anche come `suggested_display_precision` nella discovery MQTT.
@@ -50,6 +58,10 @@ const awningCluster = m.deviceAddCustomCluster(CLUSTER, {
         openPercent: attr('openPercent', 0x0011, T.UINT8),
         batteryMv: attr('batteryMv', 0x0012, T.UINT16),
         status: attr('status', 0x0013, T.UINT8),
+        resetReason: attr('resetReason', 0x0014, T.UINT8),
+        plannedCause: attr('plannedCause', 0x0015, T.UINT8),
+        dirtyResets: attr('dirtyResets', 0x0016, T.UINT16),
+        lastDirtyReason: attr('lastDirtyReason', 0x0017, T.UINT8),
     },
     commands: {},
     commandsResponse: {},
@@ -113,6 +125,54 @@ export default {
             attribute: 'status',
             lookup: {attivo: 0, deep_sleep: 1, in_carica: 2, carica_completa: 3},
             access: 'STATE',
+        }),
+
+        // ---- diagnostica avvii (inviata una volta per avvio, a rete confermata) ----
+        m.enumLookup({
+            name: 'reset_reason',
+            label: 'Motivo ultimo avvio',
+            description:
+                'Perche\' l\'ESP32 e\' ripartito (esp_reset_reason): deepsleep = risveglio normale, sw = riavvio software, ' +
+                'poweron = alimentazione ridata; brownout, panic e *_wdt sono reset sporchi',
+            cluster: CLUSTER,
+            attribute: 'resetReason',
+            lookup: RESET_REASONS,
+            access: 'STATE',
+            entityCategory: 'diagnostic',
+        }),
+        m.enumLookup({
+            name: 'planned_cause',
+            label: 'Causa pianificata',
+            description:
+                'Perche\' il firmware aveva addormentato o riavviato il dispositivo prima di questo avvio ' +
+                '(nessuna = non deciso dal firmware, es. accensione o riavvio della libreria Zigbee)',
+            cluster: CLUSTER,
+            attribute: 'plannedCause',
+            lookup: {
+                nessuna: 0, notte: 1, batteria_bassa: 2, rete_assente: 3, zigbee_init_fallito: 4,
+                loop_di_reset: 5, pulsante_riavvio: 6, factory_reset: 7,
+            },
+            access: 'STATE',
+            entityCategory: 'diagnostic',
+        }),
+        m.numeric({
+            name: 'dirty_resets',
+            label: 'Reset sporchi',
+            description: 'Totale dei reset da brown-out, panic o watchdog (conservato anche togliendo l\'alimentazione)',
+            cluster: CLUSTER,
+            attribute: 'dirtyResets',
+            access: 'STATE',
+            entityCategory: 'diagnostic',
+        }),
+        m.enumLookup({
+            name: 'last_dirty_reason',
+            label: 'Ultimo reset sporco',
+            description: 'Motivo dell\'ultimo reset da brown-out, panic o watchdog',
+            cluster: CLUSTER,
+            attribute: 'lastDirtyReason',
+            lookup: RESET_REASONS,
+            access: 'STATE',
+            entityCategory: 'diagnostic',
         }),
 
         // ---- parametri (scrivibili da Home Assistant, salvati in NVS dal firmware) ----

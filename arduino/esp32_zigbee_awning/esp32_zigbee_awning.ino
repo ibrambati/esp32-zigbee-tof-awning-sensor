@@ -22,6 +22,10 @@
  *     sola lettura: 0x0010 DistanceMm (U16, mm)      0x0011 OpenPercent (U8, %)
  *                   0x0012 BatteryMv  (U16, mV)
  *                   0x0013 Status     (U8: 0 attivo, 1 deep sleep, 2 in carica, 3 carica completa)
+ *                   0x0014 ResetReason (U8, esp_reset_reason_t di questo avvio)
+ *                   0x0015 PlannedCause (U8, CAUSE_*: perche' il firmware ha riavviato/addormentato l'ESP l'ultima volta)
+ *                   0x0016 DirtyResets (U16, totale reset "sporchi": brown-out, panic, watchdog)
+ *                   0x0017 LastDirtyReason (U8, esp_reset_reason_t dell'ultimo reset sporco)
  *     scrittura:    0x0000 ClosedPositionZero (U16, cm)  0x0001 MaxLength (U16, cm)
  *                   0x0002 SleepStartHour (U8)           0x0003 SleepEndHour (U8)
  *                   0x0004 ReadIntervalMs (U16)      0x0005 LedMode (U8: 0 always-on, 1 blink, 2 boot-only)
@@ -33,6 +37,13 @@
  *  FW_VERSION va incrementata a ogni build da distribuire: Z2M aggiorna solo se la versione del file e' maggiore.
  *  Durante un OTA il dispositivo resta sveglio (niente deep sleep, niente light sleep) e dopo il riavvio
  *  tiene aperta una "finestra OTA" (OTA_WINDOW_MS) in cui il deep sleep notturno e' sospeso.
+ *
+ * ---- AVVIO, RIAVVII E PULSANTE (specifica: docs/BOOT_FLOW.md) ----
+ *  Ogni avvio (accensione, risveglio, reset) segue lo stesso flusso: registro del motivo del reset e
+ *  batteria a radio spenta -> Zigbee.begin() -> join -> conferma della rete (risposta Time) -> sleepy ->
+ *  laser. Ogni attesa/riavvio voluto passa da sleepAndRetry() o plannedRestart(): nessun ESP.restart() sparso.
+ *  Pulsante esterno (PIN_BUTTON): click = riavvio, 10 s = factory reset Zigbee e nuovo accoppiamento.
+ *  Il tasto BOOT della scheda non e' piu' letto dal firmware: serve solo per il download.
  */
 
 #ifndef ZIGBEE_MODE_ED
@@ -46,6 +57,8 @@
 #include <sys/time.h>
 #include "Zigbee.h"
 #include "esp_sleep.h"
+#include "esp_system.h"
+#include "esp_task_wdt.h"
 #include "driver/gpio.h"
 #include "SparkFun_VL53L1X.h"
 
@@ -56,7 +69,10 @@ static const uint8_t PIN_SCL    = 3;   // VL53L1X SCL
 static const uint8_t PIN_XSHUT  = 5;   // VL53L1X shutdown (LOW = laser spento)
 static const uint8_t PIN_VIN    = 10;   // presenza caricatore: V_IN del TP4056 con partitore 100k/150k (alto = USB collegato)
 static const uint8_t PIN_RGB    = 8;   // WS2812B integrato
-static const uint8_t PIN_BOOT   = 9;   // tasto BOOT: tenuto 3 s = factory reset Zigbee
+// Pulsante esterno tra il pin e 3V3, con 100k esterna verso GND (attivo alto). LP IO: sveglia anche dal deep sleep.
+// Click = riavvio, tenuto 10 s = factory reset Zigbee. Il tasto BOOT (GPIO9) resta solo per il download.
+static const uint8_t PIN_BUTTON = 12;
+static const bool    BUTTON_INSTALLED = true;   // false se il pulsante non e' montato (pin flottante: niente letture ne' risveglio)
 
 // ===================== ZIGBEE =====================
 static const uint8_t  ZB_ENDPOINT      = 10;
@@ -73,7 +89,22 @@ enum : uint16_t {
   ATTR_DIST_MM     = 0x0010,   // sola lettura
   ATTR_OPEN_PCT    = 0x0011,   // sola lettura
   ATTR_VBAT_MV     = 0x0012,   // sola lettura
-  ATTR_STATUS      = 0x0013    // sola lettura, valori STATUS_*
+  ATTR_STATUS      = 0x0013,   // sola lettura, valori STATUS_*
+  ATTR_RESET_REASON = 0x0014,  // sola lettura, esp_reset_reason_t di questo avvio
+  ATTR_PLANNED_CAUSE = 0x0015, // sola lettura, valori CAUSE_*
+  ATTR_DIRTY_RESETS = 0x0016,  // sola lettura, U16
+  ATTR_LAST_DIRTY   = 0x0017   // sola lettura, esp_reset_reason_t dell'ultimo reset sporco
+};
+// Perche' il firmware ha riavviato o addormentato l'ESP (salvato in RTC prima di farlo, letto all'avvio successivo)
+enum : uint8_t {
+  CAUSE_NONE = 0,            // nessuna causa registrata (es. riavvio chiesto dalla libreria Zigbee, o accensione)
+  CAUSE_NIGHT = 1,           // deep sleep notturno
+  CAUSE_LOW_BATT = 2,        // batteria sotto VBAT_MIN_BOOT all'avvio
+  CAUSE_JOIN_TIMEOUT = 3,    // rete non raggiunta (join o conferma Time)
+  CAUSE_ZB_INIT_FAIL = 4,    // stack Zigbee non inizializzato
+  CAUSE_RESET_LOOP = 5,      // troppi reset sporchi consecutivi
+  CAUSE_BUTTON_RESTART = 6,  // click sul pulsante
+  CAUSE_FACTORY_RESET = 7    // pulsante tenuto 10 s
 };
 enum : uint8_t { STATUS_ACTIVE = 0, STATUS_DEEP_SLEEP = 1, STATUS_CHARGING = 2, STATUS_CHARGED = 3 };
 static const uint16_t COORD_SHORT_ADDR = 0x0000;   // il coordinatore e' sempre 0x0000
@@ -110,11 +141,23 @@ static const uint32_t BATTERY_FIRST_DELAY_MS = 60000UL;
 // Poll interval lungo dell'end device (radio spenta tra un poll e l'altro). Tenerlo sotto ~7 s:
 // oltre, il parent puo' scartare le scritture in coda (comandi da Z2M). Le notifiche in uscita non dipendono dal poll.
 static const uint32_t ZB_POLL_INTERVAL_MS = 4000;
-// Il boot parte SEMPRE con la radio accesa (rejoin affidabile). A rete stabile enterSleepy() passa a End Device
-// sleepy a runtime: PAIRING_SETTLE_MS dopo il primo accoppiamento (lascia finire l'interview di Z2M),
-// SLEEPY_DELAY_MS dopo il join nei boot normali.
+// Il boot parte con la radio accesa. enterSleepy() passa a End Device sleepy a runtime: nei boot normali appena
+// la rete e' confermata (risposta Time), dopo il primo accoppiamento PAIRING_SETTLE_MS dopo il join (interview di Z2M).
 static const uint32_t PAIRING_SETTLE_MS   = 3UL * 60 * 1000;
-static const uint32_t SLEEPY_DELAY_MS     = 20UL * 1000;
+
+// ---- Flusso di avvio (docs/BOOT_FLOW.md) ----
+static const uint32_t ZB_BEGIN_TIMEOUT_MS = 10000;              // Zigbee.begin(): come l'esempio sleepy di Espressif (default 30 s)
+static const uint32_t JOIN_WAIT_MS        = 2UL * 60 * 1000;    // boot normale: stack connesso entro questo tempo
+static const uint32_t JOIN_WAIT_PAIRING_MS = 10UL * 60 * 1000;  // primo accoppiamento: tempo per aprire il permit join in Z2M
+static const uint32_t NET_CONFIRM_MS      = 30000;              // dopo il join: risposta Time dal coordinatore entro questo tempo
+static const uint32_t NET_CONFIRM_RETRY_MS = 2000;              // intervallo tra le richieste Time durante la conferma
+static const uint32_t RETRY_SLEEP_S       = 30UL * 60;          // attesa in deep sleep prima di riprovare (rete, batteria, loop)
+static const uint8_t  DIRTY_STREAK_MAX    = 3;                  // reset sporchi consecutivi prima della pausa RETRY_SLEEP_S
+static const float    VBAT_MIN_BOOT       = 3.40f;              // V letti dall'ADC: sotto non si accende la radio (con D1 1N5819 in serie). DA CALIBRARE
+static const uint32_t WDT_TIMEOUT_MS      = 30000;              // task watchdog su setup()/loop(): > begin (10 s) e > ReadIntervalMs massimo (10 s)
+static const uint32_t BUTTON_DEBOUNCE_MS  = 50;
+static const uint32_t BUTTON_CLICK_MAX_MS = 1000;               // rilascio entro 1 s = click (riavvio)
+static const uint32_t BUTTON_LONG_MS      = 10000;              // tenuto 10 s = factory reset al rilascio
 static const bool     INVERT_PERCENT   = false;        // true se in HA risulta invertita
 static const float    VBAT_EMPTY       = 3.2f;
 static const float    VBAT_FULL        = 4.2f;
@@ -192,6 +235,28 @@ void applySensorEnabled() {
 RTC_DATA_ATTR uint32_t lastTimeSyncEpoch = 0;   // sopravvive al deep sleep
 RTC_DATA_ATTR bool     timeValid         = false;
 
+// ===================== REGISTRO RESET =====================
+// RTC_NOINIT: non azzerata dal bootloader, sopravvive a deep sleep, ESP.restart(), panic, watchdog e (di norma)
+// brown-out; si perde solo togliendo l'alimentazione. Valida se resetMagic coincide; i totali sono copiati in NVS.
+static const uint32_t RESET_LOG_MAGIC = 0xA5E7B007;
+RTC_NOINIT_ATTR uint32_t resetMagic;
+RTC_NOINIT_ATTR uint8_t  rtcPlannedCause;     // scritta da sleepAndRetry()/plannedRestart(), letta all'avvio
+RTC_NOINIT_ATTR uint8_t  rtcDirtyStreak;      // reset sporchi consecutivi (azzerati alla prima lettura batteria)
+RTC_NOINIT_ATTR uint16_t rtcDirtyCount;       // totale reset sporchi
+RTC_NOINIT_ATTR uint8_t  rtcLastDirty;        // esp_reset_reason_t dell'ultimo reset sporco
+
+esp_reset_reason_t bootResetReason = ESP_RST_UNKNOWN;
+uint8_t            bootPlannedCause = CAUSE_NONE;   // causa salvata prima di questo avvio
+
+bool isDirtyReset(esp_reset_reason_t r) {
+  switch (r) {
+    case ESP_RST_BROWNOUT: case ESP_RST_PANIC: case ESP_RST_INT_WDT: case ESP_RST_TASK_WDT: case ESP_RST_WDT:
+      return true;
+    default:
+      return false;
+  }
+}
+
 volatile bool    timeResponseReceived = false;
 volatile bool    cfgDirty             = false;   // settato dal callback Zigbee, gestito nel loop
 volatile bool    otaRunning           = false;   // true mentre Z2M sta trasferendo un'immagine
@@ -213,10 +278,11 @@ uint32_t joinedAtMs     = 0;       // istante (millis) del join in questo boot
 uint32_t otaWindowUntilMs = 0;     // fino a questo istante (millis) il deep sleep notturno e' sospeso per l'OTA
 uint32_t ledBootUntilMs = 0;       // fine del verde in modalita' boot-only
 uint8_t  lastLedState   = 255;     // ultimo stato scritto sul LED (255 = da riapplicare)
+bool     buttonLongArmed = false;  // pulsante tenuto 10 s: LED bianco finche' non si rilascia
 
 // Dopo il join il LED e' verde secondo ledMode: sempre acceso, lampeggiante, o solo 5 s all'avvio.
 void updateLed() {
-  if (!zbJoined) return;           // prima del join lo gestisce setup() (blu lampeggiante)
+  if (!zbJoined || buttonLongArmed) return;   // prima del join lo gestisce setup(); a pulsante armato resta bianco
   bool on;
   switch (cfg.ledMode) {
     case LED_BLINK:     on = (millis() % 2000UL) < 200UL; break;                  // 200 ms ogni 2 s
@@ -265,7 +331,42 @@ void setPaired(bool v) {
   prefs.end();
 }
 
-// Passa a End Device sleepy senza riavviare: rx_on_when_idle off, poll lungo, light sleep dello stack.
+// Prima cosa dell'avvio: legge il motivo del reset e aggiorna il registro in RTC. Nessuna scrittura in flash qui
+// (un brown-out durante la scrittura potrebbe corromperla): i totali si copiano in NVS con saveResetLog().
+void updateResetLog() {
+  bootResetReason = esp_reset_reason();
+  if (resetMagic != RESET_LOG_MAGIC) {             // accensione: RTC non valida, si riparte dai totali in NVS
+    prefs.begin("awning", true);
+    rtcDirtyCount = prefs.getUShort("rstDirty", 0);
+    rtcLastDirty  = prefs.getUChar("rstLast", ESP_RST_UNKNOWN);
+    prefs.end();
+    rtcPlannedCause = CAUSE_NONE;
+    rtcDirtyStreak  = 0;
+    resetMagic = RESET_LOG_MAGIC;
+  }
+  bootPlannedCause = rtcPlannedCause;
+  rtcPlannedCause = CAUSE_NONE;                    // consumata: un reset successivo senza causa resta CAUSE_NONE
+  if (isDirtyReset(bootResetReason)) {
+    if (rtcDirtyCount < 0xFFFF) rtcDirtyCount++;
+    if (rtcDirtyStreak < 0xFF) rtcDirtyStreak++;
+    rtcLastDirty = (uint8_t)bootResetReason;
+  }
+  Serial.printf("Reset: motivo %d, causa pianificata %u, sporchi consecutivi %u, totali %u\n",
+                (int)bootResetReason, bootPlannedCause, rtcDirtyStreak, rtcDirtyCount);
+}
+
+// Copia i totali in NVS (solo se cambiati). Da chiamare a batteria verificata.
+void saveResetLog() {
+  prefs.begin("awning", false);
+  if (prefs.getUShort("rstDirty", 0) != rtcDirtyCount) prefs.putUShort("rstDirty", rtcDirtyCount);
+  if (prefs.getUChar("rstLast", ESP_RST_UNKNOWN) != rtcLastDirty) prefs.putUChar("rstLast", rtcLastDirty);
+  prefs.end();
+}
+
+// Passa a End Device sleepy senza riavviare: rx_on_when_idle off e poll lungo.
+// esp_zb_sleep_enable() resta, ma con le librerie Arduino precompilate (niente CONFIG_PM_ENABLE / tickless idle, e
+// segnale CAN_SLEEP non gestito dal core) quasi certamente non produce light sleep: il risparmio viene dalla radio
+// spenta tra un poll e l'altro. Da confermare misurando la corrente.
 void enterSleepy() {
   Serial.println("Passo a modalita' sleepy (basso consumo)");
   if (pairingMode) { setPaired(true); pairingMode = false; }
@@ -399,6 +500,16 @@ public:
 
   void publishStatus(uint8_t st) { publishCustom(ATTR_STATUS, &st); }
 
+  // Registro reset: inviato una volta per avvio, a rete confermata (anche gli avvii falliti arrivano qui, in ritardo).
+  void publishResetLog() {
+    uint8_t reason = (uint8_t)bootResetReason, cause = bootPlannedCause, last = rtcLastDirty;
+    uint16_t dirty = rtcDirtyCount;
+    publishCustom(ATTR_RESET_REASON, &reason);
+    publishCustom(ATTR_PLANNED_CAUSE, &cause);
+    publishCustom(ATTR_DIRTY_RESETS, &dirty);
+    publishCustom(ATTR_LAST_DIRTY, &last);
+  }
+
   // updatePct = false: si riporta solo la tensione e la percentuale resta all'ultimo valore valido
   // (in carica la tensione ai morsetti e' gonfiata dalla corrente di carica).
   void publishBattery(float volts, uint8_t pct, bool updatePct = true) {
@@ -496,6 +607,8 @@ private:
     esp_zb_attribute_list_t *c = esp_zb_zcl_attr_list_create(CUSTOM_CLUSTER);
     uint16_t zero = cfg.zeroCm, mx = cfg.maxCm, itv = cfg.intervalMs, dist = 0, vbat = 0;
     uint8_t  s = cfg.sleepStart, e = cfg.sleepEnd, pct = 0, lm = cfg.ledMode, se = cfg.sleepEnabled, sn = cfg.sensorEnabled, st = STATUS_ACTIVE;
+    uint8_t  rr = 0, pc = 0, ld = 0;
+    uint16_t dr = 0;
     const uint8_t rw = ESP_ZB_ZCL_ATTR_ACCESS_READ_WRITE | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING;
     const uint8_t ro = ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY  | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING;
     esp_zb_custom_cluster_add_custom_attr(c, ATTR_ZERO_CM,     ESP_ZB_ZCL_ATTR_TYPE_U16, rw, &zero);
@@ -510,6 +623,10 @@ private:
     esp_zb_custom_cluster_add_custom_attr(c, ATTR_OPEN_PCT,    ESP_ZB_ZCL_ATTR_TYPE_U8,  ro, &pct);
     esp_zb_custom_cluster_add_custom_attr(c, ATTR_VBAT_MV,     ESP_ZB_ZCL_ATTR_TYPE_U16, ro, &vbat);
     esp_zb_custom_cluster_add_custom_attr(c, ATTR_STATUS,      ESP_ZB_ZCL_ATTR_TYPE_U8,  ro, &st);
+    esp_zb_custom_cluster_add_custom_attr(c, ATTR_RESET_REASON,  ESP_ZB_ZCL_ATTR_TYPE_U8,  ro, &rr);
+    esp_zb_custom_cluster_add_custom_attr(c, ATTR_PLANNED_CAUSE, ESP_ZB_ZCL_ATTR_TYPE_U8,  ro, &pc);
+    esp_zb_custom_cluster_add_custom_attr(c, ATTR_DIRTY_RESETS,  ESP_ZB_ZCL_ATTR_TYPE_U16, ro, &dr);
+    esp_zb_custom_cluster_add_custom_attr(c, ATTR_LAST_DIRTY,    ESP_ZB_ZCL_ATTR_TYPE_U8,  ro, &ld);
     esp_zb_cluster_list_add_custom_cluster(_cluster_list, c, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
   }
 
@@ -562,11 +679,14 @@ uint32_t secondsToSleepEnd(const tm &now) {
   return (uint32_t)(endT - nowT);
 }
 
-void enterNightDeepSleep(uint32_t seconds) {
-  Serial.printf("Deep sleep notturno per %lu s\n", (unsigned long)seconds);
+// ---- Punto di uscita unico ----
+// Ogni attesa voluta (notte, batteria bassa, rete assente, troppi reset) passa da qui: salva la causa in RTC,
+// spegne laser e LED e va in deep sleep. Si risveglia allo scadere del tempo, se si collega il caricatore o se
+// si preme il pulsante. Il risveglio e' un avvio completo che ripercorre setup().
+void sleepAndRetry(uint8_t cause, uint32_t seconds) {
+  Serial.printf("Deep sleep per %lu s (causa %u)\n", (unsigned long)seconds, cause);
   Serial.flush();
-  zbAwning.publishStatus(STATUS_DEEP_SLEEP);    // da addormentato non puo' trasmettere: lo dice prima
-  delay(500);                                   // tempo per far partire il report
+  rtcPlannedCause = cause;
   if (sensorOk) distanceSensor.stopRanging();
   digitalWrite(PIN_XSHUT, LOW);                 // laser spento
   gpio_hold_en((gpio_num_t)PIN_XSHUT);          // mantiene LOW durante il deep sleep
@@ -576,20 +696,94 @@ void enterNightDeepSleep(uint32_t seconds) {
   ledOff();
   esp_sleep_enable_timer_wakeup((uint64_t)seconds * 1000000ULL);
 #if SOC_PM_SUPPORT_EXT1_WAKEUP
-  // Risveglio anche quando si collega il caricatore (GPIO10 e' un LP IO). ext1 e non gpio_wakeup:
-  // quest'ultimo con la configurazione di default attiva il pull-down interno e falserebbe il partitore.
+  // Risveglio anche con il caricatore (GPIO10) e il pulsante: entrambi LP IO, attivi alti, con resistenza esterna
+  // verso GND. ext1 e non gpio_wakeup: quest'ultimo attiva il pull-down interno e falserebbe il partitore.
+  uint64_t mask = 1ULL << PIN_VIN;
   gpio_pullup_dis((gpio_num_t)PIN_VIN);
   gpio_pulldown_dis((gpio_num_t)PIN_VIN);
-  esp_sleep_enable_ext1_wakeup(1ULL << PIN_VIN, ESP_EXT1_WAKEUP_ANY_HIGH);
+  if (BUTTON_INSTALLED) mask |= 1ULL << PIN_BUTTON;
+  esp_sleep_enable_ext1_wakeup(mask, ESP_EXT1_WAKEUP_ANY_HIGH);
 #endif
   esp_deep_sleep_start();
+}
+
+// Riavvio voluto (pulsante): salva la causa e riparte. L'unico ESP.restart() del firmware.
+void plannedRestart(uint8_t cause) {
+  Serial.printf("Riavvio (causa %u)\n", cause);
+  Serial.flush();
+  rtcPlannedCause = cause;
+  ledOff();
+  ESP.restart();
+}
+
+void enterNightDeepSleep(uint32_t seconds) {
+  zbAwning.publishStatus(STATUS_DEEP_SLEEP);    // da addormentato non puo' trasmettere: lo dice prima
+  delay(500);                                   // tempo per far partire il report
+  sleepAndRetry(CAUSE_NIGHT, seconds);
+}
+
+// ===================== PULSANTE =====================
+// Attivo alto (pulsante verso 3V3, 100k esterna verso GND). Il pull-down interno resta attivo: senza partitore
+// non disturba e tiene il pin basso se la resistenza esterna manca.
+void configureButtonPin() {
+  if (!BUTTON_INSTALLED) return;
+  pinMode(PIN_BUTTON, INPUT);
+  gpio_pullup_dis((gpio_num_t)PIN_BUTTON);
+  gpio_pulldown_en((gpio_num_t)PIN_BUTTON);
+}
+
+// Da chiamare spesso (loop e attesa del join). Click (< 1 s) = riavvio; tenuto 10 s = LED bianco e, al rilascio,
+// factory reset Zigbee con nuovo accoppiamento. Rilasci tra 1 e 10 s non fanno nulla. Mai durante un OTA.
+uint32_t buttonPressStart = 0;
+void pollButton() {
+  if (!BUTTON_INSTALLED) return;
+  bool pressed = digitalRead(PIN_BUTTON) == HIGH;
+  uint32_t now = millis();
+  if (pressed) {
+    if (!buttonPressStart) buttonPressStart = now | 1;
+    if (!buttonLongArmed && now - buttonPressStart >= BUTTON_LONG_MS) {
+      buttonLongArmed = true;
+      ledColor(40, 40, 40);                       // bianco: rilascia per il factory reset
+      Serial.println("Pulsante: rilascia per il factory reset");
+    }
+    return;
+  }
+  if (!buttonPressStart) return;
+  uint32_t held = now - buttonPressStart;
+  bool longArmed = buttonLongArmed;
+  buttonPressStart = 0;
+  buttonLongArmed = false;
+  if (otaRunning) return;
+  if (longArmed) {
+    Serial.println("Factory reset Zigbee (pulsante)");
+    Serial.flush();
+    setPaired(false);                             // al prossimo avvio si riparte in modalita' accoppiamento
+    rtcPlannedCause = CAUSE_FACTORY_RESET;
+    Zigbee.factoryReset();                        // riavvia
+  } else if (held >= BUTTON_DEBOUNCE_MS && held < BUTTON_CLICK_MAX_MS) {
+    plannedRestart(CAUSE_BUTTON_RESTART);
+  } else {
+    lastLedState = 255;                           // pressione annullata: il LED torna allo stato normale
+  }
+}
+
+// ===================== WATCHDOG =====================
+// Task watchdog sul task di setup()/loop(): un blocco oltre WDT_TIMEOUT_MS diventa un reset TASK_WDT (sporco),
+// contato nel registro. Il core Arduino lo nutre a ogni giro di loop(); le attese lunghe di setup() lo nutrono a mano.
+void startWatchdog() {
+  esp_task_wdt_config_t wdt = {.timeout_ms = WDT_TIMEOUT_MS, .idle_core_mask = 0, .trigger_panic = true};
+  if (esp_task_wdt_reconfigure(&wdt) != ESP_OK) esp_task_wdt_init(&wdt);
+  enableLoopWDT();
 }
 
 // ===================== SETUP =====================
 void setup() {
   Serial.begin(115200);
-  loadConfig();
+  startWatchdog();                                 // copre anche un blocco dentro setup() (es. Zigbee.begin())
 
+  // ---- 1. Avvio a radio spenta: registro reset, pin, batteria ----
+  updateResetLog();
+  loadConfig();
   isTimerWake = (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER);
   gpio_hold_dis((gpio_num_t)PIN_XSHUT);
 #if SOC_GPIO_SUPPORT_HOLD_IO_IN_DSLP
@@ -599,83 +793,102 @@ void setup() {
   setenv("TZ", TZ_STRING, 1);
   tzset();
 
-  pinMode(PIN_BOOT, INPUT_PULLUP);
   pinMode(PIN_XSHUT, OUTPUT);
-  digitalWrite(PIN_XSHUT, LOW);   // laser spento finche' non serve
+  digitalWrite(PIN_XSHUT, LOW);   // laser spento finche' la rete non e' confermata
   configureChargerPin();
-  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT1) Serial.println("Risveglio: caricatore collegato");
+  configureButtonPin();
+  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT1) Serial.println("Risveglio: caricatore o pulsante");
+  updateCharger();
 
-  // --- Zigbee ---
+  // ---- 2. Decisione: batteria (a radio e laser spenti) e loop di reset ----
+  float vBoot = readBatteryVolts();
+  Serial.printf("Batteria all'avvio %.2f V (%s)\n", vBoot, chargerConnected ? "caricatore collegato" : "a batteria");
+  if (!chargerConnected && vBoot < VBAT_MIN_BOOT) sleepAndRetry(CAUSE_LOW_BATT, RETRY_SLEEP_S);
+  if (rtcDirtyStreak >= DIRTY_STREAK_MAX) {
+    rtcDirtyStreak = 0;                            // dopo la pausa si riprova da capo
+    sleepAndRetry(CAUSE_RESET_LOOP, RETRY_SLEEP_S);
+  }
+
+  // ---- 3. Zigbee: una sola chiamata a begin(), uguale per ogni tipo di avvio ----
   zbAwning.buildClusters();                                  // dopo loadConfig(): attributi custom = valori NVS
   zbAwning.setManufacturerAndModel("Ivan", "AwningToF");
   zbAwning.setPowerSource(ZB_POWER_SOURCE_BATTERY, 100, 42); // aggiunge il cluster Power Config
   zbAwning.onOTAStateChange(otaStateCallback);
   Zigbee.addEndpoint(&zbAwning);
   Serial.printf("Firmware 0x%08lX\n", (unsigned long)FW_VERSION);
-  // Il boot parte SEMPRE a radio accesa (rejoin affidabile). Il passaggio a End Device sleepy avviene
-  // a runtime, a rete stabile (vedi enterSleepy()). DIAG_RX_ON_IDLE 1 = resta sempre acceso (diagnosi).
+  // Il boot parte a radio accesa; il passaggio a End Device sleepy avviene a runtime (vedi enterSleepy()).
+  // DIAG_RX_ON_IDLE 1 = resta sempre acceso (diagnosi).
   #define DIAG_RX_ON_IDLE 0
   pairingMode = !loadPaired();
   Serial.printf("Modalita': %s (boot a radio accesa)\n", pairingMode ? "accoppiamento" : "normale");
   Zigbee.setRxOnWhenIdle(true);
+  Zigbee.setTimeout(ZB_BEGIN_TIMEOUT_MS);
 
-  if (!isTimerWake) ledColor(0, 0, 40);   // blu fisso mentre lo stack parte (begin() puo' bloccare fino a 30 s)
+  if (!isTimerWake) ledColor(0, 0, 40);   // blu fisso mentre lo stack parte
   if (!Zigbee.begin(ZIGBEE_END_DEVICE)) {
-    if (!Zigbee.initialized()) {          // errore vero di inizializzazione: riavvio
-      Serial.println("Zigbee init fallito, riavvio");
-      delay(1000);
-      ESP.restart();
+    if (!Zigbee.initialized()) {          // errore vero di inizializzazione: pausa e nuovo tentativo
+      Serial.println("Zigbee init fallito");
+      sleepAndRetry(CAUSE_ZB_INIT_FAIL, RETRY_SLEEP_S);
     }
-    // Stack avviato ma rete non ancora trovata entro 30 s (es. permit join chiuso): NON riavviare,
-    // lo stack continua a cercare in background. Si aspetta nel ciclo qui sotto con il LED blu lampeggiante.
+    // Stack avviato ma rete non ancora trovata: lo stack continua a cercare in background.
     Serial.println("Zigbee: rete non ancora trovata, continuo a cercare");
   }
+  feedLoopWDT();
 
-  // --- Attesa join (LED blu lampeggiante solo se NON e' un risveglio notturno) ---
+  // ---- 4. Join e conferma della rete (LED blu lampeggiante solo se NON e' un risveglio a tempo) ----
   bool led = !isTimerWake;
   bool ledState = false;
-  uint32_t joinBootStart = 0;
-  const uint32_t joinWaitStart = millis();
+  const uint32_t joinWaitMs = pairingMode ? JOIN_WAIT_PAIRING_MS : JOIN_WAIT_MS;
+  uint32_t t0 = millis();
   while (!Zigbee.connected()) {
-    if (millis() - joinWaitStart > 600000UL) {   // 10 minuti senza rete: riavvio e riprovo
-      Serial.println("Nessuna rete dopo 10 minuti, riavvio");
-      ESP.restart();
+    if (millis() - t0 > joinWaitMs) {
+      Serial.println("Join non riuscito");
+      sleepAndRetry(CAUSE_JOIN_TIMEOUT, RETRY_SLEEP_S);
     }
     if (led) { ledState = !ledState; ledState ? ledColor(0, 0, 40) : ledOff(); }
-    // BOOT tenuto 3 s anche durante l'attesa del join = factory reset Zigbee
-    if (digitalRead(PIN_BOOT) == LOW) {
-      if (!joinBootStart) joinBootStart = millis();
-      if (millis() - joinBootStart > 3000) {
-        Serial.println("Factory reset Zigbee (attesa join)");
-        setPaired(false);           // al prossimo avvio si riparte in modalita' accoppiamento
-        Zigbee.factoryReset();      // riavvia
-      }
-    } else joinBootStart = 0;
+    pollButton();                       // anche qui: factory reset possibile se la rete non si trova
+    feedLoopWDT();
     delay(150);
   }
-  // Connesso al controller: da qui il LED segue ledMode (verde). In boot-only niente LED dopo un risveglio notturno.
   zbJoined = true;
   joinedAtMs = millis();
-  Serial.println(pairingMode ? "Join completato: resto sveglio per l'interview, poi passo a sleepy"
-                             : "Join completato");
+
+  // Per un dispositivo gia' accoppiato connected() diventa vero appena lo stack ricarica i dati dalla flash,
+  // prima di parlare col padre: la rete e' confermata solo dalla risposta Time del coordinatore.
+  timeResponseReceived = false;
+  t0 = millis();
+  uint32_t lastTimeReqMs = 0;
+  while (!timeResponseReceived) {
+    if (millis() - t0 > NET_CONFIRM_MS) {
+      Serial.println("Rete non confermata (nessuna risposta Time)");
+      sleepAndRetry(CAUSE_JOIN_TIMEOUT, RETRY_SLEEP_S);
+    }
+    if (!lastTimeReqMs || millis() - lastTimeReqMs >= NET_CONFIRM_RETRY_MS) {
+      lastTimeReqMs = millis() | 1;
+      zbAwning.requestTime();
+    }
+    if (led) { ledState = !ledState; ledState ? ledColor(0, 0, 40) : ledOff(); }
+    pollButton();
+    feedLoopWDT();
+    delay(150);
+  }
+  Serial.println(pairingMode ? "Rete confermata: resto sveglio per l'interview, poi passo a sleepy"
+                             : "Rete confermata");
+  // Da qui il LED segue ledMode (verde). In boot-only niente LED dopo un risveglio a tempo.
   ledBootUntilMs = isTimerWake ? 0 : millis() + LED_BOOT_MS;
+  lastLedState = 255;
   updateLed();
 
-  // --- Sincronizzazione ora ---
-  bool needSync = !timeValid || (time(nullptr) - lastTimeSyncEpoch) > TIME_RESYNC_S;
-  if (needSync) {
-    uint32_t t0 = millis();
-    while (!timeResponseReceived && millis() - t0 < TIME_WAIT_MS) {
-      zbAwning.requestTime();
-      delay(2000);
-    }
-  }
+  // ---- 5. Fasi in sequenza, a rete confermata ----
+  if (!DIAG_RX_ON_IDLE && !pairingMode) enterSleepy();   // primo accoppiamento: sleepy dal loop dopo l'interview
+  zbAwning.publishResetLog();
+  saveResetLog();                                         // batteria gia' verificata al punto 2
 
-  // --- OTA: interroga Z2M (prima richiesta entro ~1 minuto, poi ogni ora in automatico) ---
+  // OTA: interroga Z2M (prima richiesta entro ~1 minuto, poi ogni ora in automatico)
   zbAwning.requestOTAUpdate();
   otaWindowUntilMs = millis() + OTA_WINDOW_MS;
 
-  // --- Sensore laser ---
+  // Sensore laser: per ultimo, quando radio e rete sono gia' assestate
   Wire.begin(PIN_SDA, PIN_SCL);
   if (cfg.sensorEnabled) {
     sensorOk = initSensor();
@@ -683,7 +896,7 @@ void setup() {
     if (!sensorOk) Serial.println("VL53L1X non trovato! (riprovo ogni 15 s)");
     else Serial.println("VL53L1X inizializzato");
   } else {
-    Serial.println("Sensore spento da switch (XSHUT LOW)");   // XSHUT e' gia' LOW da prima di Zigbee.begin()
+    Serial.println("Sensore spento da switch (XSHUT LOW)");
   }
 
   // la prima misura batteria (BATTERY_FIRST_DELAY_MS dopo il join) e il primo stato li invia il loop
@@ -692,28 +905,18 @@ void setup() {
 
 // ===================== LOOP =====================
 uint32_t lastBatteryMs = 0;
-uint32_t bootPressStart = 0;
 uint8_t  lastStatus = 255;
 
 void loop() {
-  // Passaggio a sleepy a rete stabile (mai durante un OTA): dopo il primo accoppiamento attende che finisca
-  // l'interview di Z2M, nei boot normali solo SLEEPY_DELAY_MS.
-  if (!DIAG_RX_ON_IDLE && !sleepyActive && zbJoined && !otaRunning &&
-      millis() - joinedAtMs > (pairingMode ? PAIRING_SETTLE_MS : SLEEPY_DELAY_MS)) {
+  // Primo accoppiamento: passaggio a sleepy dopo l'interview di Z2M (mai durante un OTA).
+  // Nei boot normali enterSleepy() e' gia' stato chiamato da setup() a rete confermata.
+  if (!DIAG_RX_ON_IDLE && !sleepyActive && pairingMode && !otaRunning && millis() - joinedAtMs > PAIRING_SETTLE_MS) {
     enterSleepy();
   }
   if (cfgDirty) { cfgDirty = false; applyConfigChange(); }
   updateLed();
 
-  // Factory reset Zigbee (tasto BOOT 3 s)
-  if (digitalRead(PIN_BOOT) == LOW) {
-    if (!bootPressStart) bootPressStart = millis();
-    if (millis() - bootPressStart > 3000 && !otaRunning) {   // mai un factory reset a OTA in corso
-      Serial.println("Factory reset Zigbee");
-      setPaired(false);           // al prossimo avvio si riparte in modalita' accoppiamento
-      Zigbee.factoryReset();      // riavvia
-    }
-  } else bootPressStart = 0;
+  pollButton();   // click = riavvio, 10 s = factory reset Zigbee
 
   // --- Caricatore: a ogni cambio rilegge subito la batteria ---
   if (updateCharger()) lastBatteryMs = 0;
@@ -777,6 +980,7 @@ void loop() {
     bool pctValid = currentStatus() == STATUS_CHARGED || (!chargerConnected && settled);
     zbAwning.publishBattery(v, pct, pctValid);
     Serial.printf("Batteria %.2f V (%u%%%s)\n", v, pct, pctValid ? "" : ", non pubblicata");
+    rtcDirtyStreak = 0;   // arrivato qui (>= 60 s dopo il join) l'avvio e' riuscito: azzera i reset sporchi consecutivi
   }
 
   // --- Stato: attivo / in carica / carica completa (deep sleep lo invia enterNightDeepSleep) ---

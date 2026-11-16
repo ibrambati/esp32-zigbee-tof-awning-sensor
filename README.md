@@ -40,7 +40,8 @@ Repository layout:
 | **VL53L1X** | Time-of-Flight (ToF) laser distance sensor | 1 | Range up to 4 meters (Long Mode) |
 | **TP4056H Charging Module** | USB-C Li-Ion battery charger with protection | 1 | Must include double protection (6 pads, e.g., HW-107) |
 | **18650 Li-Ion Battery** | 3.7V ricaricabile cell (3200 mAh) | 1 | *Unprotected* (flat top) model recommended for outdoors |
-| **100kΩ Resistors** | Carbon or metal film resistors | 3 | 1% tolerance: 2 for the battery voltage divider, 1 for the charger detection divider |
+| **100kΩ Resistors** | Carbon or metal film resistors | 4 | 1% tolerance: 2 for the battery voltage divider, 1 for the charger detection divider, 1 as the button pull-down |
+| **Push button** | 6×6 mm tactile switch (THT) | 1 | Arduino firmware: click = restart, hold 10 s = factory reset of the Zigbee pairing |
 | **150kΩ Resistor** | Carbon or metal film resistor | 1 | Charger detection divider (Arduino firmware) |
 
 ### Hardware photos
@@ -65,7 +66,8 @@ According to the official specs of the [Waveshare ESP32-H2-Zero](https://wavesha
 | **GPIO 1** | ADC1_CH0 / GPIO | Connected to the center of the divider | Analog pin used to measure battery voltage |
 | **GPIO 10** | LP GPIO | Connected to the center of the charger divider | Arduino firmware: high when the TP4056H USB input is powered (charger connected), also wakes the board from deep sleep |
 | **GPIO 8** | Onboard WS2812B | Status LED, no external wiring | Arduino firmware: blue while joining Zigbee, then green according to the `ledMode` setting (always on by default, blinking, or on for 5 s at boot only) |
-| **GPIO 9** | BOOT button | Onboard button, no external wiring | Arduino firmware: hold for 3 s to factory reset the Zigbee pairing |
+| **GPIO 9** | BOOT button | Onboard button, no external wiring | Download mode only (not read by the Arduino firmware) |
+| **GPIO 12** | LP GPIO | External push button to 3V3, 100kΩ pull-down to GND | Arduino firmware: click = restart, hold 10 s = factory reset of the Zigbee pairing; also wakes the board from deep sleep |
 
 > 💡 **Power Saving Tip:** To fully eliminate parasitic power drain during Deep Sleep, it is highly recommended to desolder or cut the trace of the onboard **WS2812B** RGB LED. Otherwise, it will continuously draw around 1mA even when the chip is asleep. The Arduino firmware uses this LED for the pairing feedback: if you remove it, you only lose the status light. If you keep it, set `ledMode` to `boot-only`: the default (`always-on`) keeps the LED lit after pairing and costs battery.
 
@@ -96,6 +98,11 @@ All grounds must merge into a single logical point (**Common GND**). Follow this
    * Output of R3 ──► Input of a 150kΩ resistor (**R4**) **AND** **`GPIO 10`** pin on the ESP32-H2-Zero
    * Output of R4 ──► **Common GND**
    * With 5 V on `IN+` the pin sees about 3.0 V (logic high); without the charger R4 pulls it to 0 V, so no external pull-down is needed. The firmware disables the internal pull resistors: the internal pull-down (~45 kΩ) in parallel with R4 would drag the pin down to about 1.3 V
+
+5. **External Button (Arduino firmware):**
+   * One leg of the push button ──► **`3V3`** pin on the ESP32-H2-Zero
+   * Other leg ──► **`GPIO 12`** **AND** a 100kΩ resistor (**R5**) to **Common GND**
+   * Optional: 100 nF in parallel with R5 against bounce. Active high, so the button can also wake the board from deep sleep together with the charger detection
 
 ---
 

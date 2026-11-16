@@ -6,8 +6,9 @@ How the [Arduino sketch](../arduino/README.md) is organised at run time: boot an
 
 ![Firmware overview: boot, join, main loop, night deep sleep](img/firmware-overview.svg)
 
-- **Boot** always starts with the radio on, so the device rejoins the saved network reliably. The earlier approach (reboot into a sleepy configuration) failed to rejoin and is not used any more.
-- **Switch to sleepy** runs at run time, 20 s after the join (3 minutes after the very first pairing, to let the Zigbee2MQTT interview finish). It sets `rx_on_when_idle` off, a long poll interval and stack light sleep. At the time of writing `esp_zb_get_rx_on_when_idle()` still reports `1` after the switch, so the radio stays on: this is under investigation. Reports to the coordinator work either way.
+- **Boot** follows one flow for every kind of start (power-on, wake-up, reset): reset log and battery check with the radio off, one `Zigbee.begin()`, join, network confirmed by the coordinator's Time response, then sleepy and laser. Every planned wait or restart goes through one exit point (`sleepAndRetry()` / `plannedRestart()`). Details, causes and constants: [BOOT_FLOW.md](BOOT_FLOW.md).
+- **Switch to sleepy** runs as soon as the network is confirmed on a normal boot (3 minutes after the very first pairing, to let the Zigbee2MQTT interview finish). It sets `rx_on_when_idle` off and a long poll interval. At the time of writing `esp_zb_get_rx_on_when_idle()` still reports `1` after the switch: this is under investigation. Reports to the coordinator work either way. Stack light sleep is requested too, but the precompiled Arduino libraries have no power management (`CONFIG_PM_ENABLE`) and the core does not handle the `CAN_SLEEP` signal, so it most likely has no effect.
+- **Reset log**: the reason of every reset and the cause of every planned sleep/restart are kept in RTC memory and published once per boot (attributes `0x0014`-`0x0017`). After 3 consecutive brown-out/panic/watchdog resets the board sleeps 30 minutes instead of restarting again.
 - **Config from Z2M**: writes arrive in the Zigbee task, which only updates the in-memory values and raises a flag. The loop then validates them, saves them to NVS and publishes them back, so the Zigbee task never does heavy I/O.
 - **Night deep sleep** happens only when enabled, the time is synced, the charger is not connected and no OTA is running or recent (10-minute window after each boot).
 
@@ -26,7 +27,7 @@ Example with `ReadIntervalMs = 500`. Hatched boxes are the 10 ms checks just bef
 | `M` | Laser measuring, 100 ms (`LASER_BUDGET_MS`) |
 | rest | Laser idle until the next period |
 | `R` | ESP32 reads the result and decides whether to report |
-| sleep | ESP32 `delay()`: with sleep enabled the CPU can enter light sleep |
+| sleep | ESP32 `delay()` (no light sleep with the precompiled Arduino libraries, see Overview) |
 | polling | A few 10 ms checks just before the result is ready (dashed boxes in the drawing) |
 
 ## Battery reading
@@ -48,5 +49,7 @@ The battery is read every 10 minutes (every minute with the charger connected, a
 | `BATTERY_FIRST_DELAY_MS` | 60000 | First battery reading after the join |
 | `ADC_SAMPLES` | 15 | Samples per reading (median) |
 | `PAIRING_SETTLE_MS` | 180000 | Time before switching to sleepy after the first pairing |
-| `SLEEPY_DELAY_MS` | 20000 | Time before switching to sleepy on a normal boot |
+| `NET_CONFIRM_MS` | 30000 | Wait for the coordinator's Time response after the join (then sleepy on a normal boot) |
+| `RETRY_SLEEP_S` | 1800 | Deep sleep before retrying (no network, low battery, reset loop) |
+| `VBAT_MIN_BOOT` | 3.40 V | Below this ADC reading the radio is not started (to be calibrated) |
 | `ZB_POLL_INTERVAL_MS` | 4000 | Long poll interval used for the sleepy switch |
